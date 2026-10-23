@@ -1,0 +1,79 @@
+---
+# Dev environment overlay, layered on top of charts/app/values.yaml by the
+# app-dev Argo CD Application (gitops/applications/app-dev.yaml).
+#
+# This file is PARTLY machine-owned. The `image.tag` line below is rewritten
+# automatically by the `gitops-update` job in .github/workflows/ci.yml on
+# every merge to main, using yq, then committed back to this repo as
+# github-actions[bot] with a `[skip ci]` commit message. Everything else is
+# meant to be edited by hand.
+#
+# Goal for dev: fast, cheap, debuggable. Not "production-like" — that is what
+# staging is for.
+
+replicaCount: 1
+
+image:
+  # updated by CI — do not edit manually
+  tag: "main"
+
+env:
+  APP_ENV: "dev"
+  # Verbose logging in dev: every request, every warning. This would be far
+  # too noisy (and too expensive once shipped to a log backend) in prod.
+  LOG_LEVEL: "debug"
+  READY_DELAY: "2s"
+  PRESTOP_DELAY: "5s"
+  SHUTDOWN_TIMEOUT: "15s"
+  READ_TIMEOUT: "10s"
+  WRITE_TIMEOUT: "30s"
+  IDLE_TIMEOUT: "120s"
+  MAX_BODY_BYTES: "1048576"
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 32Mi
+  limits:
+    memory: 64Mi
+
+# Autoscaling stays off in dev: one replica is enough traffic capacity for
+# manual testing, and a flapping HPA on noisy local load would just be
+# confusing to watch.
+autoscaling:
+  enabled: false
+
+# No PDB in dev: with replicaCount 1, "minAvailable: 1" would mean the single
+# pod could never be voluntarily evicted, and there is no availability target
+# worth protecting on a throwaway environment anyway.
+podDisruptionBudget:
+  enabled: false
+
+ingress:
+  enabled: true
+  className: "nginx"
+  hosts:
+    - host: app.dev.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# Prometheus Operator is not assumed to be installed in the minimal dev
+# cluster, so the ServiceMonitor stays off here even though metrics are still
+# exposed on /metrics for a manual `curl` or `kubectl port-forward` check.
+serviceMonitor:
+  enabled: false
+
+# NetworkPolicy enforcement depends on the CNI (see the long comment in
+# charts/app/values.yaml). minikube's default CNI does not enforce it, so
+# leaving this on in dev is a no-op rather than a risk — kept on anyway so
+# the manifest is exercised by `helm template` and `kubeconform` in CI even
+# though it has no runtime effect locally.
+networkPolicy:
+  enabled: true
+  ingressControllerNamespace: ingress-nginx
+  monitoringNamespace: monitoring
+  allowDNS: true
+  dnsNamespace: kube-system
+  allowAllEgress: true

@@ -1,0 +1,106 @@
+---
+# Weekly, schedule-driven security sweep. This is deliberately SEPARATE from
+# ci.yml's per-push security job: ci.yml scans the one image that was just
+# built; this workflow re-scans the REPOSITORY (secrets, misconfigurations,
+# rendered manifests) on a schedule so that a vulnerability disclosed
+# AFTER a commit — not caused by it — still gets caught, instead of only
+# ever being checked at the moment of a code change.
+name: Security Scan (scheduled)
+
+on:
+  schedule:
+    # Every Monday at 05:00 UTC — ahead of the Monday Dependabot run in
+    # dependabot.yml, so a human has a current secrets/misconfig report
+    # before that day's dependency PRs start landing.
+    - cron: "0 5 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  gitleaks:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          # Full history: a secret committed once and removed in a later
+          # commit is still a leaked secret — it is sitting in git history
+          # forever, readable by anyone who clones the repo. A shallow clone
+          # would only ever see the current tip and miss exactly that case.
+          fetch-depth: 0
+
+      - uses: gitleaks/gitleaks-action@44c470edf6d18991fe1dc7cbd4cdd48ee52edb20 # v2.3.6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  trivy-repo:
+    name: Repository scan (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      # Repo-mode Trivy scan: Go module vulnerabilities from app/go.sum,
+      # Dockerfile misconfigurations, and any IaC misconfigurations in the
+      # Helm chart templates, all in one pass.
+      - uses: aquasecurity/trivy-action@6c175e9c4083a92bbca2f9724c8a5e33bc2d97a5 # 0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-repo-weekly.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          exit-code: "0"
+
+      - uses: github/codeql-action/upload-sarif@2d92b76c45b91eb800e23d61f1263236e2f0ca6b # v3.26.11
+        with:
+          sarif_file: trivy-repo-weekly.sarif
+          category: trivy-repo-weekly
+
+  manifest-lint:
+    name: Rendered manifest security lint (kube-linter + checkov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - uses: azure/setup-helm@fe7b79cd5ee1e45176fcad797de68ecaf3ca4814 # v4.2.0
+        with:
+          version: v3.16.1
+
+      - name: Render prod manifests
+        run: |
+          mkdir -p /tmp/rendered
+          helm template app charts/app -f gitops/environments/prod/values.yaml \
+            > /tmp/rendered/prod.yaml
+
+      # kube-linter checks for Kubernetes-specific anti-patterns on the
+      # RENDERED output — missing resource limits, running as root, a
+      # writable root filesystem, a Service with no NetworkPolicy — the same
+      # category of mistake Trivy's generic IaC scanner is weaker at
+      # catching because it does not understand Kubernetes semantics as
+      # deeply.
+      - uses: stackrox/kube-linter-action@c8c0aa3d9c17d7085f80daf0f742ba2e28c4e2fb # v1.0.7
+        with:
+          directory: /tmp/rendered
+          config: .kube-linter.yaml
+
+      # checkov cross-checks the same manifests against a much larger,
+      # compliance-oriented policy set (CIS Kubernetes Benchmark among them)
+      # — different rule engine, different false-positive/false-negative
+      # profile, deliberately redundant with kube-linter for defence in
+      # depth on a demo repo's single rendered manifest set.
+      - uses: bridgecrewio/checkov-action@3899626be481facfe40f3728fb0a4d39bd2a0cc8 # v12.2932.0
+        with:
+          directory: /tmp/rendered
+          framework: kubernetes
+          soft_fail: true
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+
+      - uses: github/codeql-action/upload-sarif@2d92b76c45b91eb800e23d61f1263236e2f0ca6b # v3.26.11
+        if: always()
+        with:
+          sarif_file: checkov-results.sarif
+          category: checkov

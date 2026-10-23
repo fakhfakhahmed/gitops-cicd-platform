@@ -1,0 +1,206 @@
+---
+# Tag-triggered release: `git tag v1.2.3 && git push --tags`.
+#
+# This is a DIFFERENT path from ci.yml's main-branch build. ci.yml produces
+# mutable, floating `main`/`sha-xxxxx` images meant to flow through the
+# dev -> staging -> prod GitOps pipeline. This workflow produces an
+# immutable, versioned RELEASE: a semver-tagged image, a GitHub Release with
+# an auto-generated changelog, and the Helm chart itself packaged and pushed
+# to GHCR as an OCI artifact — the thing someone outside this repo would
+# actually `helm install` from.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ghcr.io/fakhfakhahmed/gitops-cicd-platform/app
+  CHART_NAME: ghcr.io/fakhfakhahmed/gitops-cicd-platform/charts/app
+
+jobs:
+  build-release-image:
+    name: Build & push release image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3.2.0
+      - uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+
+      - uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # type=semver produces the full set a consumer expects from a tagged
+      # release: v1.2.3, 1.2.3, 1.2, and 1 (the last two let someone track
+      # "latest 1.2.x" or "latest 1.x" without pinning a full patch version).
+      - uses: docker/metadata-action@8e5442c4ef9f78752691e2d8f8d19755c6f78e81 # v5.5.1
+        id: meta
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      - uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        id: push
+        with:
+          context: app
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          sbom: true
+          provenance: true
+
+  sign-release-image:
+    name: Sign release image
+    needs: build-release-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fbd635fe99da96a # v3.6.0
+
+      - uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sign release image by digest
+        run: cosign sign --yes "${IMAGE_NAME}@${DIGEST}"
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          DIGEST: ${{ needs.build-release-image.outputs.digest }}
+          COSIGN_EXPERIMENTAL: "1"
+
+  changelog-and-release:
+    name: Changelog + GitHub Release
+    needs: [build-release-image, sign-release-image]
+    runs-on: ubuntu-latest
+    permissions:
+      # contents: write only to create the GitHub Release itself.
+      contents: write
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          fetch-depth: 0
+
+      # Changelog generated from Conventional Commits between this tag and
+      # the previous one — the same convention commitlint enforces on every
+      # PR title in pr-validation.yml, which is what makes this generation
+      # reliable rather than a best-effort guess at commit intent.
+      - name: Generate changelog
+        id: changelog
+        run: |
+          set -euo pipefail
+          CURRENT_TAG="${GITHUB_REF_NAME}"
+          PREVIOUS_TAG=$(git tag --sort=-creatordate | grep -v "^${CURRENT_TAG}$" | head -n1 || true)
+
+          {
+            echo "changelog<<EOF"
+            echo "## What's changed"
+            echo ""
+            if [ -n "$PREVIOUS_TAG" ]; then
+              git log "${PREVIOUS_TAG}..${CURRENT_TAG}" --pretty=format:"- %s (%h)" \
+                | grep -E '^- (feat|fix|perf|refactor|security)(\(.+\))?!?:' || echo "- No conventional-commit changes found."
+              echo ""
+              echo "**Full diff**: https://github.com/${GITHUB_REPOSITORY}/compare/${PREVIOUS_TAG}...${CURRENT_TAG}"
+            else
+              echo "- Initial release."
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@e7a8f85e1c67a31e6ed99a94b41bd0b71bbee6b8 # v2.0.8
+        with:
+          generate_release_notes: false
+          body: |
+            ${{ steps.changelog.outputs.changelog }}
+
+            ### Artifacts published by this release
+
+            | Artifact | Reference |
+            |---|---|
+            | Container image | `${{ env.IMAGE_NAME }}:${{ needs.build-release-image.outputs.version }}` |
+            | Image digest | `${{ needs.build-release-image.outputs.digest }}` |
+            | Helm chart (OCI) | `${{ env.CHART_NAME }}:${{ needs.build-release-image.outputs.version }}` |
+
+            Verify the image signature:
+            ```
+            cosign verify \
+              --certificate-identity-regexp "https://github.com/${{ github.repository }}/.github/workflows/release.yml@.*" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              ${{ env.IMAGE_NAME }}@${{ needs.build-release-image.outputs.digest }}
+            ```
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          CHART_NAME: ${{ env.CHART_NAME }}
+
+  package-and-push-chart:
+    name: Package & push Helm chart (OCI)
+    needs: build-release-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - uses: azure/setup-helm@fe7b79cd5ee1e45176fcad797de68ecaf3ca4814 # v4.2.0
+        with:
+          version: v3.16.1
+
+      - name: Set chart version to release tag
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.build-release-image.outputs.version }}"
+          # Chart.yaml's `version` and `appVersion` both track the release tag
+          # for a tagged release — unlike the main-branch flow, where they
+          # stay at the last hand-set value and the real identity of "what's
+          # deployed" lives in gitops/environments/*/values.yaml instead.
+          sed -i "s/^version: .*/version: ${VERSION}/" charts/app/Chart.yaml
+          sed -i "s/^appVersion: .*/appVersion: \"${VERSION}\"/" charts/app/Chart.yaml
+
+      - name: helm package
+        run: helm package charts/app --destination /tmp/chart-out
+
+      # Helm's native OCI support (stable since Helm 3.8) pushes a chart to
+      # any OCI-compliant registry — GHCR included — as a regular OCI
+      # artifact. No separate chart museum or chart repository index to host
+      # and keep available; the chart lives right next to the image it
+      # deploys, versioned the same way.
+      - name: helm registry login
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: helm push
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.build-release-image.outputs.version }}"
+          helm push "/tmp/chart-out/app-${VERSION}.tgz" oci://ghcr.io/fakhfakhahmed/gitops-cicd-platform/charts

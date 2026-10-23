@@ -1,0 +1,88 @@
+---
+# Dev Application: fully automated, the fastest feedback loop in the
+# pipeline. This is the Application whose values file (gitops/environments/
+# dev/values.yaml) gets rewritten by ci.yml's gitops-update job on every
+# merge to main — so a merge reaches a running pod here with zero human
+# action, usually within a couple of minutes of the GitHub Actions run
+# finishing.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-dev
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: gitops-cicd-platform
+    env: dev
+  annotations:
+    # Controls Application ordering within the Argo CD UI tree and, more
+    # importantly, documents intent: dev is wave 0, the first thing that
+    # should exist and the first thing that should sync on any shared change
+    # (e.g. a chart template update that affects every environment).
+    argocd.argoproj.io/sync-wave: "0"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: gitops-platform
+
+  sources:
+    # Two sources combined: the chart itself, and the environment's values
+    # file layered on top via Helm's valueFiles-from-ref mechanism. This is
+    # what lets ONE chart serve THREE environments without copy-pasting
+    # templates — the only thing that differs per environment is data.
+    - repoURL: https://github.com/fakhfakhahmed/gitops-cicd-platform.git
+      targetRevision: main
+      path: charts/app
+      helm:
+        valueFiles:
+          - $values/gitops/environments/dev/values.yaml
+    - repoURL: https://github.com/fakhfakhahmed/gitops-cicd-platform.git
+      targetRevision: main
+      ref: values
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: app-dev
+
+  syncPolicy:
+    automated:
+      # prune: a resource removed from the chart/values (e.g. deleting the
+      # Ingress block) is removed from the cluster on the next sync, not left
+      # behind as an orphan nobody remembers creating.
+      prune: true
+      # selfHeal: `kubectl edit deployment` or `kubectl scale` against this
+      # namespace is reverted automatically. In dev this mostly catches
+      # "I was debugging and forgot to revert" rather than drift from an
+      # incident — see docs/gitops.md for the full story on why this is safe
+      # to leave on everywhere except prod.
+      selfHeal: true
+      # allowEmpty: false is the default and intentional — if the rendered
+      # manifest set is ever accidentally empty (e.g. a bad values override
+      # disables every resource), Argo CD refuses to prune everything rather
+      # than silently deleting the whole environment.
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      # Server-side apply avoids the 3-way-merge annotation bloat of
+      # client-side apply and matches how `kubectl apply --server-side`
+      # behaves, which is where the ecosystem is heading.
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true
+      - PrunePropagationPolicy=foreground
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  # Differences Argo CD should NOT treat as drift. The HPA writes
+  # spec.replicas back onto the Deployment it manages; without this, Argo CD
+  # and the HPA fight over the field forever and the Application is
+  # permanently OutOfSync whenever autoscaling has actually scaled anything.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
+
+  revisionHistoryLimit: 10

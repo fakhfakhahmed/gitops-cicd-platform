@@ -1,0 +1,37 @@
+---
+# The Argo CD control-plane namespace. Created separately from the Helm
+# install of Argo CD itself so it exists (and can carry labels/annotations)
+# even before the first `helm install argocd` runs — scripts/install-argocd
+# applies this file first, then installs the chart into it.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: argocd
+  labels:
+    # Argo CD's own manifests and the Helm chart both assume this label is
+    # present on a handful of built-in dashboards and NetworkPolicies that
+    # ship with the chart; setting it ourselves means it is correct even if
+    # we installed the namespace before the chart did.
+    app.kubernetes.io/name: argocd
+    app.kubernetes.io/part-of: gitops-cicd-platform
+    # Pod Security Admission: Argo CD's own components (repo-server, redis)
+    # run comfortably under "restricted", so we opt the namespace in rather
+    # than leaving it at the cluster default of unrestricted "privileged".
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+# The namespace the application itself lands in for local/dev use. Staging
+# and prod environments get their own namespaces (app-staging, app-prod) via
+# `CreateNamespace=true` on their respective Argo CD Applications — see
+# gitops/applications/*.yaml. This one is created up front because the dev
+# Application is the one scripts/bootstrap wires up by default.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app-dev
+  labels:
+    app.kubernetes.io/name: app
+    app.kubernetes.io/instance: app-dev
+    app.kubernetes.io/part-of: gitops-cicd-platform
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest

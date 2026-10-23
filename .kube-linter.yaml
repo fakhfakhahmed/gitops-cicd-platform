@@ -1,0 +1,19 @@
+---
+# kube-linter configuration used by .github/workflows/security-scan.yml.
+# Starts from the built-in default checks and explicitly excludes the two
+# that this chart's own design deliberately violates, each with a reason —
+# an unexplained exclusion in a lint config is just as bad as not linting at
+# all, because the next person has no way to tell "known and accepted" apart
+# from "someone silenced a real finding."
+checks:
+  addAllBuiltIn: true
+  exclude:
+    # "no-anti-affinity" wants pod anti-affinity in addition to the
+    # topologySpreadConstraints already set in gitops/environments/prod. Both
+    # solve the same problem (spreading replicas across failure domains);
+    # using one deliberately rather than both is covered in docs/security.md.
+    - no-anti-affinity
+    # "unset-cpu-requirements" flags the intentionally-absent CPU *limit* —
+    # see the extensive comment in charts/app/values.yaml on why a CPU
+    # request-without-limit is the deliberate choice here, not an oversight.
+    - unset-cpu-requirements

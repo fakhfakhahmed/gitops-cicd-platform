@@ -1,0 +1,64 @@
+---
+# Staging Application: still automated (no human clicks "sync"), but it only
+# ever receives a new image tag via a PROMOTION PR (promote.yml), never
+# directly from ci.yml. That PR is the review gate for staging — a human
+# approves the diff in gitops/environments/staging/values.yaml before it
+# merges and Argo CD picks it up.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-staging
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: gitops-cicd-platform
+    env: staging
+  annotations:
+    # Wave 1: staging syncs after dev. For a shared-infra change this gives a
+    # few minutes of dev-only exposure before it touches the next
+    # environment — a cheap, free-form canary on the GitOps control plane
+    # itself.
+    argocd.argoproj.io/sync-wave: "1"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: gitops-platform
+
+  sources:
+    - repoURL: https://github.com/fakhfakhahmed/gitops-cicd-platform.git
+      targetRevision: main
+      path: charts/app
+      helm:
+        valueFiles:
+          - $values/gitops/environments/staging/values.yaml
+    - repoURL: https://github.com/fakhfakhahmed/gitops-cicd-platform.git
+      targetRevision: main
+      ref: values
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: app-staging
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true
+      - PrunePropagationPolicy=foreground
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 5m
+
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
+
+  revisionHistoryLimit: 10

@@ -1,0 +1,267 @@
+{{- include "app.validateValues" . -}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "app.fullname" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+  annotations:
+    # Surfaced by `kubectl describe deploy` and by the Argo CD UI. Having the
+    # exact source commit on the object itself removes a whole class of "which
+    # version is actually running?" archaeology during an incident.
+    app.kubernetes.io/revision: {{ .Values.env.GIT_COMMIT | default .Values.image.tag | default .Chart.AppVersion | quote }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  # When the HPA is enabled this field is OMITTED ENTIRELY rather than set.
+  #
+  # This matters. `replicas` and the HPA both write spec.replicas. If Helm
+  # renders replicas: 2 while the HPA has scaled to 8, then every Argo CD sync
+  # resets the Deployment to 2, the HPA notices the shortfall and scales back
+  # to 8, Argo CD sees drift and resets it again... a reconciliation fight that
+  # shows up as endless pod churn and a permanently OutOfSync Application.
+  # Omitting the field leaves spec.replicas owned solely by the HPA.
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+
+  revisionHistoryLimit: {{ .Values.deployment.revisionHistoryLimit }}
+  minReadySeconds: {{ .Values.deployment.minReadySeconds }}
+  progressDeadlineSeconds: {{ .Values.deployment.progressDeadlineSeconds }}
+
+  # IMMUTABLE after creation. See the long note in _helpers.tpl: this is why
+  # the selector uses only name + instance and never version.
+  selector:
+    matchLabels:
+      {{- include "app.selectorLabels" . | nindent 6 }}
+
+  strategy:
+    type: {{ .Values.deployment.strategy.type }}
+    {{- if eq .Values.deployment.strategy.type "RollingUpdate" }}
+    rollingUpdate:
+      # maxSurge 1 / maxUnavailable 0: add a new pod, wait for it to be Ready,
+      # only then remove an old one. Capacity never drops below replicaCount.
+      maxSurge: {{ .Values.deployment.strategy.rollingUpdate.maxSurge }}
+      maxUnavailable: {{ .Values.deployment.strategy.rollingUpdate.maxUnavailable }}
+    {{- end }}
+
+  template:
+    metadata:
+      annotations:
+        # ---------------------------------------------------------------
+        # The config checksum trick.
+        #
+        # Kubernetes does NOT restart pods when a ConfigMap changes. With
+        # envFrom the new values are not even picked up live - the env block
+        # is materialised at container start. So without this annotation you
+        # change LOG_LEVEL, Argo CD syncs the ConfigMap, the Application goes
+        # green... and every pod keeps running the old config. Silently.
+        #
+        # Hashing the rendered ConfigMap into a pod annotation makes the pod
+        # TEMPLATE change whenever the config changes, which is what the
+        # Deployment controller actually watches. A config edit therefore
+        # produces a real, controlled rolling update.
+        # ---------------------------------------------------------------
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "app.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      serviceAccountName: {{ include "app.serviceAccountName" . }}
+      # Explicitly do not project an API token into the pod unless asked.
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+
+      {{- with .Values.deployment.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+
+      # The kubelet's hard shutdown budget. Must exceed
+      # preStop + PRESTOP_DELAY + SHUTDOWN_TIMEOUT.
+      terminationGracePeriodSeconds: {{ .Values.deployment.terminationGracePeriodSeconds }}
+
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+
+      containers:
+        - name: {{ .Chart.Name }}
+          image: {{ include "app.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+
+          # envFrom pulls in every key of the ConfigMap as an env var. The
+          # checksum annotation above is what makes changes here take effect.
+          envFrom:
+            - configMapRef:
+                name: {{ include "app.configMapName" . }}
+
+          env:
+            # Downward API: the pod tells the process who and where it is.
+            # POD_NAME in particular is what makes the /  endpoint's
+            # "hostname" field meaningful - curl the Service a few times and
+            # you can watch requests land on different replicas.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # APP_VERSION mirrors the deployed image tag into the process, so
+            # the JSON served by / matches what GitOps says should be running.
+            # If these two ever disagree, something bypassed the pipeline.
+            - name: APP_VERSION
+              value: {{ .Values.image.tag | default .Chart.AppVersion | quote }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+          {{- if .Values.probes.startup.enabled }}
+          # A startup probe SUSPENDS liveness and readiness until it passes,
+          # giving a slow boot all the time it needs without loosening the
+          # steady-state liveness thresholds.
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.startup.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.startup.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          {{- end }}
+
+          {{- if .Values.probes.liveness.enabled }}
+          # Liveness: "restart me if I am wedged". Hits /healthz, which checks
+          # nothing external on purpose.
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+            successThreshold: {{ .Values.probes.liveness.successThreshold }}
+          {{- end }}
+
+          {{- if .Values.probes.readiness.enabled }}
+          # Readiness: "send me traffic or don't". Hits /readyz, which returns
+          # 503 while warming up and while draining. This is the probe that
+          # makes rolling updates lossless.
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+            successThreshold: {{ .Values.probes.readiness.successThreshold }}
+          {{- end }}
+
+          {{- if and .Values.lifecycle.preStop.enabled (ne .Values.lifecycle.preStop.type "none") }}
+          lifecycle:
+            # -----------------------------------------------------------
+            # preStop runs BEFORE the kubelet sends SIGTERM, and the kubelet
+            # blocks on it. It widens the window during which the pod is
+            # already removed from Service endpoints but still serving, which
+            # is what absorbs in-flight traffic from kube-proxy rules that
+            # have not converged yet.
+            #
+            # NOTE the hook type. The usual recipe is
+            #   exec: ["/bin/sh", "-c", "sleep 5"]
+            # and it is IMPOSSIBLE here: the runtime image is distroless, so
+            # there is no /bin/sh. That hook would fail with FailedPreStopHook
+            # and the drain window would silently not exist.
+            #
+            # `sleep:` is the native SleepAction (Kubernetes >= 1.30, beta and
+            # on by default since 1.29) - no shell needed.
+            # -----------------------------------------------------------
+            preStop:
+              {{- if eq .Values.lifecycle.preStop.type "sleep" }}
+              sleep:
+                seconds: {{ .Values.lifecycle.preStop.seconds }}
+              {{- else if eq .Values.lifecycle.preStop.type "httpGet" }}
+              # Fallback for clusters older than 1.29: a round-trip to our own
+              # health endpoint. Crude, but it needs no shell and works
+              # everywhere.
+              httpGet:
+                path: {{ .Values.lifecycle.preStop.httpGetPath }}
+                port: http
+              {{- end }}
+          {{- end }}
+
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+          volumeMounts:
+            {{- if .Values.tmpDir.enabled }}
+            # Required by readOnlyRootFilesystem. Without a writable /tmp the
+            # Go runtime, TLS session caching and os.CreateTemp all fail, and
+            # the pod CrashLoopBackOffs with an error that never says
+            # "read-only filesystem" in an obvious place.
+            - name: tmp
+              mountPath: /tmp
+            {{- end }}
+            {{- with .Values.volumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+      volumes:
+        {{- if .Values.tmpDir.enabled }}
+        - name: tmp
+          emptyDir:
+            # Lives on the node, dies with the pod. Correct for scratch; never
+            # use emptyDir for anything you would miss.
+            sizeLimit: {{ .Values.tmpDir.sizeLimit }}
+        {{- end }}
+        {{- with .Values.volumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+
+      {{- with .Values.topologySpreadConstraints }}
+      # Spread replicas across failure domains. A PDB protects against
+      # voluntary disruption; this protects against a single node (or zone)
+      # taking every replica with it, which a PDB cannot.
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

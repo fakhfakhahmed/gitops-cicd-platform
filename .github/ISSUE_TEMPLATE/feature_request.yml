@@ -1,0 +1,50 @@
+---
+name: Feature request
+description: Propose a new capability for the app, chart, or pipeline.
+title: "feat: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This repo is a portfolio/demo platform, but issues are handled like a
+        real one: describe the problem before the solution.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: What can't you do today, or what is painful/manual that shouldn't be?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How would you implement it? Reference specific files/directories if you can.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where would this live?
+      options:
+        - Application (app/)
+        - Helm chart (charts/)
+        - GitOps config (gitops/)
+        - CI/CD workflow (.github/workflows/)
+        - Scripts (scripts/)
+        - Documentation
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false

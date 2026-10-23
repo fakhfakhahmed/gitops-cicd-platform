@@ -1,0 +1,82 @@
+{{- if .Values.autoscaling.enabled -}}
+---
+# autoscaling/v2 - stable since Kubernetes 1.23.
+#
+# v1 could only scale on CPU, and expressed it as a single scalar field. v2
+# introduced the `metrics` list (multiple metrics, memory, custom and external
+# metrics) and crucially the `behavior` block, which is the difference between
+# an HPA that works and an HPA that oscillates.
+#
+# Do not write autoscaling/v2beta2 - removed in 1.26.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "app.fullname" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  # scaleTargetRef is how the HPA finds its workload. It points at the
+  # Deployment, and the HPA then writes to the Deployment's /scale
+  # subresource. This is also why deployment.yaml must NOT render a `replicas`
+  # field when the HPA is enabled - two controllers writing the same field
+  # fight forever.
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "app.fullname" . }}
+
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+
+  metrics:
+    {{- if .Values.autoscaling.targetCPUUtilizationPercentage }}
+    # Utilization is a PERCENTAGE OF THE REQUEST, not of the node's capacity
+    # and not of the limit. With requests.cpu = 50m, a target of 70% means the
+    # HPA aims for ~35m of actual usage per pod.
+    #
+    # Corollary that catches everyone: an HPA on `Utilization` is meaningless
+    # without a CPU *request*. No request, no denominator, no metric - the HPA
+    # reports <unknown> and never scales.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+    {{- end }}
+    {{- if .Values.autoscaling.targetMemoryUtilizationPercentage }}
+    # Memory is a weak autoscaling signal for a garbage-collected runtime: Go
+    # holds onto freed pages, so utilisation ratchets up and rarely comes
+    # back down. Treat this as a leak alarm, not as a scaling policy - which
+    # is why the target is set high.
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetMemoryUtilizationPercentage }}
+    {{- end }}
+
+  {{- with .Values.autoscaling.behavior }}
+  # ---------------------------------------------------------------------
+  # behavior controls the RATE of change, which is what separates a useful
+  # HPA from a thrashing one.
+  #
+  # Asymmetric on purpose:
+  #   scale UP   fast - being slow to add capacity under load is an outage.
+  #   scale DOWN slow - being eager to remove capacity turns a brief traffic
+  #                     dip into a cold-start storm when traffic returns.
+  #
+  # stabilizationWindowSeconds on scaleDown makes the HPA consider the HIGHEST
+  # recommendation over the window before shrinking. 300s means a one-minute
+  # lull cannot trigger a scale-down that is immediately reversed.
+  #
+  # Interaction worth knowing: scale-down evicts pods, and evictions are
+  # subject to the PodDisruptionBudget. A PDB with minAvailable equal to
+  # minReplicas will block the HPA from ever scaling down, and the only
+  # symptom is replica count that goes up and never comes back.
+  # ---------------------------------------------------------------------
+  behavior:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

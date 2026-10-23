@@ -1,0 +1,195 @@
+---
+# PR-only gate. Everything here is static analysis against the PR's diff —
+# nothing builds an image or touches a cluster. The point is to catch the
+# categories of mistake that a human reviewer is bad at spotting by eye:
+# a YAML indentation slip, a Helm template that renders but is semantically
+# invalid Kubernetes, a non-conventional commit title, or a diff whose
+# rendered-manifest impact is bigger than the PR description suggests.
+name: PR Validation
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited]
+
+concurrency:
+  group: pr-validation-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  yamllint:
+    name: yamllint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Install yamllint
+        run: pip install --quiet yamllint==1.35.1
+
+      # Repo-root .yamllint.yml is the single source of truth for style rules
+      # (line length, truthy values, document-start markers); nothing here
+      # duplicates that config.
+      - name: Lint YAML
+        run: yamllint -c .yamllint.yml .
+
+  helm:
+    name: helm lint + template + kubeconform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - uses: azure/setup-helm@fe7b79cd5ee1e45176fcad797de68ecaf3ca4814 # v4.2.0
+        with:
+          version: v3.16.1
+
+      - name: helm lint
+        run: helm lint charts/app --strict
+
+      - name: Install kubeconform
+        run: |
+          curl -sSL \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
+            | tar -xz kubeconform
+          sudo mv kubeconform /usr/local/bin/kubeconform
+
+      # Render every environment with its real overlay and validate the
+      # result against the Kubernetes OpenAPI schemas. `helm lint` only
+      # checks that the chart renders and passes its own schema; it has no
+      # idea whether the OUTPUT is a structurally valid Deployment/HPA/
+      # NetworkPolicy. kubeconform is what actually answers that question,
+      # and it answers it here, in a PR, instead of as an Argo CD sync
+      # failure after merge.
+      #
+      # -strict rejects unknown fields (catches a typo'd field name that
+      # Kubernetes would otherwise just silently ignore) and
+      # -summary prints a pass/fail count even when everything is clean.
+      - name: helm template | kubeconform (dev)
+        run: |
+          helm template app charts/app -f gitops/environments/dev/values.yaml \
+            | kubeconform -strict -summary -kubernetes-version 1.29.0 \
+                -schema-location default \
+                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+
+      - name: helm template | kubeconform (staging)
+        run: |
+          helm template app charts/app -f gitops/environments/staging/values.yaml \
+            | kubeconform -strict -summary -kubernetes-version 1.29.0 \
+                -schema-location default \
+                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+
+      - name: helm template | kubeconform (prod)
+        run: |
+          helm template app charts/app -f gitops/environments/prod/values.yaml \
+            | kubeconform -strict -summary -kubernetes-version 1.29.0 \
+                -schema-location default \
+                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+
+      - name: Render prod manifest for diff comment
+        if: always()
+        run: |
+          helm template app charts/app -f gitops/environments/prod/values.yaml \
+            > /tmp/rendered-prod.yaml
+
+      - uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874 # v4.4.0
+        if: always()
+        with:
+          name: rendered-prod-manifest
+          path: /tmp/rendered-prod.yaml
+          retention-days: 14
+
+  commitlint:
+    name: commitlint (PR title)
+    runs-on: ubuntu-latest
+    steps:
+      # Conventional Commits on the PR TITLE, not every individual commit:
+      # this repo squash-merges, so the PR title becomes the one commit
+      # message that ends up on main and the one that CHANGELOG generation
+      # in release.yml actually parses.
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - uses: actions/setup-node@0a44ba7841725637a19e28fa30b79a866c81b0a1 # v4.0.4
+        with:
+          node-version: "20"
+
+      - run: npm install --no-save @commitlint/cli@19 @commitlint/config-conventional@19
+
+      - name: Lint PR title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          echo "$PR_TITLE" | npx commitlint \
+            --config .commitlintrc.json \
+            --verbose
+
+  diff-comment:
+    name: Post rendered-manifest diff
+    needs: helm
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          fetch-depth: 0
+
+      - uses: azure/setup-helm@fe7b79cd5ee1e45176fcad797de68ecaf3ca4814 # v4.2.0
+        with:
+          version: v3.16.1
+
+      # Render prod manifests from the PR branch AND from main, then diff
+      # them. This is what lets a reviewer see "this PR changes replica
+      # count 3 -> 5 and adds a NetworkPolicy egress rule" directly in the
+      # PR conversation, instead of having to mentally render two Helm
+      # charts to figure out the blast radius of a values.yaml one-liner.
+      - name: Render current branch
+        run: helm template app charts/app -f gitops/environments/prod/values.yaml > /tmp/after.yaml
+
+      - name: Render main
+        run: |
+          git fetch origin main
+          git worktree add /tmp/main-checkout origin/main
+          helm template app /tmp/main-checkout/charts/app \
+            -f /tmp/main-checkout/gitops/environments/prod/values.yaml > /tmp/before.yaml || touch /tmp/before.yaml
+
+      - name: Compute diff
+        id: diff
+        run: |
+          {
+            echo 'diff<<EOF'
+            diff -u /tmp/before.yaml /tmp/after.yaml || true
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const diff = `${{ steps.diff.outputs.diff }}`;
+            const body = diff.trim().length
+              ? `### Rendered manifest diff (prod overlay)\n\n\`\`\`diff\n${diff}\n\`\`\``
+              : `### Rendered manifest diff (prod overlay)\n\nNo change to the rendered prod manifest.`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const marker = "<!-- helm-template-diff -->";
+            const existing = comments.find(c => c.body.includes(marker));
+            const finalBody = `${marker}\n${body}`;
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: finalBody,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: finalBody,
+              });
+            }

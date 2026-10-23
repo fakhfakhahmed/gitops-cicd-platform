@@ -1,0 +1,48 @@
+---
+# `helm test` support. A Pod annotated with the helm.sh/hook: test hook is NOT
+# installed during `helm install`/`upgrade` — it is only created when someone
+# explicitly runs `helm test <release>`, which is exactly what you want from a
+# smoke test: on-demand verification, not extra steady-state load on the
+# cluster.
+#
+# This is deliberately a real HTTP check, not a tautological "pod exists"
+# check: it curls /healthz and /readyz through the Service (not the pod
+# directly), which proves the Service selector, the container port name, and
+# the application's own readiness logic all actually agree with each other —
+# three places this chart could be silently broken that `kubectl get pods`
+# would never reveal.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "app.fullname" . }}-test-connection
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+  annotations:
+    # hook-delete-policy cleans the test pod up automatically after it
+    # finishes, win or lose, so repeated `helm test` runs do not leave a trail
+    # of completed/failed pods for someone to clean up manually.
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": hook-succeeded,hook-failed
+spec:
+  restartPolicy: Never
+  containers:
+    - name: wget
+      # busybox is intentionally NOT the distroless app image — the app image
+      # has no shell and no wget by design (that is the point of distroless).
+      # The test container is throwaway tooling, not the workload, so a tiny
+      # general-purpose image is the right tool here.
+      image: busybox:1.36
+      command:
+        - sh
+        - -c
+        - |
+          set -eu
+          echo "Checking {{ include "app.fullname" . }}:{{ .Values.service.port }}/healthz ..."
+          wget -q -O- --timeout=5 \
+            http://{{ include "app.fullname" . }}:{{ .Values.service.port }}/healthz
+          echo ""
+          echo "Checking {{ include "app.fullname" . }}:{{ .Values.service.port }}/readyz ..."
+          wget -q -O- --timeout=5 \
+            http://{{ include "app.fullname" . }}:{{ .Values.service.port }}/readyz
+          echo ""
+          echo "Both endpoints responded. Service is reachable and the app reports ready."

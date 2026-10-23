@@ -1,0 +1,95 @@
+---
+# An AppProject is Argo CD's multi-tenancy boundary: it answers "what is THIS
+# set of Applications allowed to touch" independently of RBAC on who can
+# operate them. Every Application in this repo sets `spec.project` to this
+# project's name — an Application referencing an unknown project is rejected
+# outright by the API server's admission webhook, so this file must exist
+# (and sync) before any child Application can be created, which is why
+# root-app.yaml lists it first under gitops/applications.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: gitops-platform
+  namespace: argocd
+spec:
+  description: >-
+    Delivery project for the gitops-cicd-platform demo app across
+    dev/staging/prod. Scopes what source repos, destination clusters/
+    namespaces and resource kinds Applications in this project may use.
+
+  # Only this repository may be used as a source. Without this restriction,
+  # anyone able to create an Application CR in the cluster could point it at
+  # an arbitrary repo and have Argo CD apply whatever that repo contains —
+  # turning Argo CD's own sync privileges into an attacker's deployment tool.
+  sourceRepos:
+    - https://github.com/fakhfakhahmed/gitops-cicd-platform.git
+
+  # Destinations: the in-cluster API server, restricted to the three
+  # namespaces this platform actually owns. "*" on the server with a
+  # namespace allowlist is the common pattern for a single-cluster platform;
+  # a true multi-cluster project would also restrict `server`.
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: app-dev
+    - server: https://kubernetes.default.svc
+      namespace: app-staging
+    - server: https://kubernetes.default.svc
+      namespace: app-prod
+    - server: https://kubernetes.default.svc
+      namespace: argocd
+
+  # Cluster-scoped resources Applications in this project may create. Empty
+  # (the default if omitted) would mean NONE, which breaks CreateNamespace
+  # and the Namespace objects under gitops/bootstrap. Scoped to exactly the
+  # kinds this platform needs, nothing more — no ClusterRoleBindings, no
+  # CustomResourceDefinitions, which a compromised source repo could
+  # otherwise use to escalate cluster-wide.
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+
+  # Namespaced resources allowed. "*" group/kind is deliberately NOT used:
+  # an explicit allowlist means a template that starts emitting, say, a
+  # Secret of type kubernetes.io/service-account-token or a RoleBinding is a
+  # sync error you notice in CI/Argo CD, not a surprise in the cluster.
+  namespaceResourceWhitelist:
+    - group: "apps"
+      kind: Deployment
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ConfigMap
+    - group: ""
+      kind: ServiceAccount
+    - group: "networking.k8s.io"
+      kind: Ingress
+    - group: "networking.k8s.io"
+      kind: NetworkPolicy
+    - group: "policy"
+      kind: PodDisruptionBudget
+    - group: "autoscaling"
+      kind: HorizontalPodAutoscaler
+    - group: "monitoring.coreos.com"
+      kind: ServiceMonitor
+
+  roles:
+    - name: readonly
+      description: Read-only visibility into this project's Applications.
+      policies:
+        - p, proj:gitops-platform:readonly, applications, get, gitops-platform/*, allow
+      groups:
+        - gitops-cicd-platform:viewers
+
+  # Sync windows restrict WHEN automated/manual syncs are allowed to run, on
+  # top of (not instead of) the manual-sync policy already set on app-prod.
+  # This is a second, independent control: even if someone later flips
+  # app-prod to automated sync, pushes are still blocked outside business
+  # hours. Belt and braces for a project standing in for "the one that
+  # matters" in a demo repo.
+  syncWindows:
+    - kind: allow
+      schedule: "0 8 * * 1-5"
+      duration: 10h
+      applications:
+        - app-prod
+      manualSync: true

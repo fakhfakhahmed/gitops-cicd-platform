@@ -1,0 +1,31 @@
+# CODEOWNERS
+#
+# One maintainer, so this file is mostly a statement of intent and a template
+# for a team repo: it is what makes GitHub require Ahmed's review on anything
+# touching delivery-critical paths, and it shows how you'd slice ownership
+# by directory on a bigger team (platform folks own gitops/ and charts/,
+# app developers own app/, security/platform owns the workflows).
+
+# Default owner for anything not matched below.
+*                           @fakhfakhahmed
+
+# The delivery pipeline itself — changes here can push arbitrary code to
+# every environment, so they get the tightest scrutiny.
+/.github/workflows/         @fakhfakhahmed
+/.github/dependabot.yml     @fakhfakhahmed
+
+# GitOps source of truth — anyone who can merge here can change what's
+# running in prod (subject to app-prod's manual-sync gate).
+/gitops/                    @fakhfakhahmed
+
+# The Helm chart that every environment deploys.
+/charts/                    @fakhfakhahmed
+
+# The application itself.
+/app/                       @fakhfakhahmed
+
+# Documentation can be looser in a real team, but is still owned here to
+# keep README/LEARN/docs accurate as the pipeline evolves.
+/docs/                      @fakhfakhahmed
+README.md                   @fakhfakhahmed
+LEARN.md                    @fakhfakhahmed

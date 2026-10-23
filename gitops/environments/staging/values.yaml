@@ -1,0 +1,75 @@
+---
+# Staging environment overlay.
+#
+# `image.tag` here is NOT touched by ci.yml. It only ever changes via a
+# promotion PR opened by .github/workflows/promote.yml (workflow_dispatch,
+# from_env: dev -> to_env: staging), which copies the exact tag currently
+# running in dev. That PR is the review gate: a human reads the diff (usually
+# a one-line tag bump) and merges it, and only then does Argo CD's automated
+# sync pick it up. See docs/gitops.md for the full promotion flow diagram.
+#
+# Goal for staging: behave like prod in every way that matters for catching
+# real bugs (HPA, probes, resource pressure, multiple replicas) without
+# prod's blast radius or its manual-sync gate.
+
+replicaCount: 2
+
+image:
+  # updated by the promotion PR (promote.yml) — not by ci.yml directly
+  tag: "main"
+
+env:
+  APP_ENV: "staging"
+  LOG_LEVEL: "info"
+  READY_DELAY: "2s"
+  PRESTOP_DELAY: "5s"
+  SHUTDOWN_TIMEOUT: "15s"
+  READ_TIMEOUT: "10s"
+  WRITE_TIMEOUT: "30s"
+  IDLE_TIMEOUT: "120s"
+  MAX_BODY_BYTES: "1048576"
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 128Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+ingress:
+  enabled: true
+  className: "nginx"
+  hosts:
+    - host: app.staging.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# Staging DOES run the Prometheus Operator stack (or is assumed to, for the
+# purposes of this demo), so its ServiceMonitor is enabled — this is the
+# environment where dashboards and alert rules get validated against real
+# traffic shapes before they are trusted in prod.
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  scrapeTimeout: 10s
+
+networkPolicy:
+  enabled: true
+  ingressControllerNamespace: ingress-nginx
+  monitoringNamespace: monitoring
+  allowDNS: true
+  dnsNamespace: kube-system
+  allowAllEgress: true

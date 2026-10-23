@@ -1,0 +1,132 @@
+{{- if .Values.networkPolicy.enabled -}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "app.fullname" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  # ---------------------------------------------------------------------
+  # The mental model, because NetworkPolicy semantics are genuinely
+  # counter-intuitive:
+  #
+  #   * By default, Kubernetes networking is FLAT. Every pod can open a
+  #     connection to every other pod in the cluster, across namespaces.
+  #     A compromised pod in any namespace can hit this service's port
+  #     directly, bypassing the ingress controller and anything that lives
+  #     there (auth, rate limiting, WAF).
+  #
+  #   * The moment ANY NetworkPolicy selects a pod, that pod becomes
+  #     DEFAULT-DENY for the policyTypes listed. Listing `Ingress` below is
+  #     what flips the switch; the `ingress:` rules are then the allow-list.
+  #
+  #   * Rules are purely ADDITIVE and there is no "deny" rule. The union of
+  #     every policy selecting a pod is what is permitted. You cannot write
+  #     "allow everything except X".
+  #
+  #   * Within one rule, `from:` entries are OR'd. But a single entry
+  #     containing both namespaceSelector and podSelector is an AND - the
+  #     peer must match both. Putting them as two list items instead of two
+  #     keys of one item changes the meaning completely, and is the single
+  #     most common NetworkPolicy bug.
+  #
+  #   * ENFORCEMENT IS THE CNI'S JOB. Calico, Cilium and Antrea enforce
+  #     these. The default kindnet/minikube CNI does NOT - it accepts the
+  #     object and silently ignores it. `kubectl get netpol` showing your
+  #     policy proves nothing. Verify with an actual connection attempt
+  #     from a pod that should be blocked.
+  # ---------------------------------------------------------------------
+  podSelector:
+    matchLabels:
+      {{- include "app.selectorLabels" . | nindent 6 }}
+
+  policyTypes:
+    - Ingress
+    {{- if or .Values.networkPolicy.allowDNS .Values.networkPolicy.allowAllEgress .Values.networkPolicy.extraEgress }}
+    - Egress
+    {{- end }}
+
+  ingress:
+    # --- the ingress controller ------------------------------------------
+    # Matched by namespace, using kubernetes.io/metadata.name - a label the
+    # API server sets automatically on every Namespace since 1.22, so it is
+    # always present and always correct. Hand-labelling namespaces for this
+    # purpose is a step people still copy from older guides; it is no longer
+    # necessary and drifts.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressControllerNamespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.targetPort }}
+
+    # --- Prometheus -------------------------------------------------------
+    # Without this rule, enabling the NetworkPolicy breaks metrics scraping
+    # and the first symptom is a dashboard going blank, not an error. The
+    # ServiceMonitor keeps reporting as configured; the target just goes DOWN.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.monitoringNamespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.targetPort }}
+
+    # --- same-namespace peers ---------------------------------------------
+    # An empty podSelector inside a `from:` entry means "every pod in THIS
+    # namespace" (an empty namespaceSelector would mean every namespace -
+    # another sharp edge worth internalising). This keeps the helm test pod
+    # and any sidecar able to reach the service.
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.targetPort }}
+
+    {{- with .Values.networkPolicy.extraIngress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+
+  {{- if or .Values.networkPolicy.allowDNS .Values.networkPolicy.allowAllEgress .Values.networkPolicy.extraEgress }}
+  egress:
+    {{- if .Values.networkPolicy.allowDNS }}
+    # --- DNS ---------------------------------------------------------------
+    # The rule everyone forgets, and the debugging experience is miserable:
+    # every outbound hostname resolution hangs until it times out, so the
+    # application reports connection timeouts to unrelated services and
+    # nothing points at DNS. UDP 53 is the common case; TCP 53 is used for
+    # responses larger than 512 bytes and for some resolvers, so allow both.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.dnsNamespace }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- end }}
+
+    {{- if .Values.networkPolicy.allowAllEgress }}
+    # --- everything else ---------------------------------------------------
+    # An empty `to:` means "anywhere". This is the pragmatic default: this
+    # service makes no outbound calls today, so a tighter policy would be
+    # aspirational rather than tested.
+    #
+    # The production hardening step is to replace this with explicit
+    # ipBlock/namespaceSelector entries per dependency. That requires a real
+    # dependency inventory first - tightening egress without one is how you
+    # discover, in production, that your app talks to an S3 endpoint.
+    # Remember to exclude the link-local metadata address (169.254.169.254)
+    # from any ipBlock you do allow: reaching it is a direct path to cloud
+    # instance credentials.
+    - to: []
+    {{- end }}
+
+    {{- with .Values.networkPolicy.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+{{- end }}

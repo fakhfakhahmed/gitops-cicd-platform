@@ -1,0 +1,25 @@
+# Patterns here are excluded when packaging the chart with `helm package`.
+# Keeps the .tgz artifact — the thing that actually gets pushed to GHCR as an
+# OCI artifact in release.yml — free of editor cruft and VCS metadata that has
+# no business inside a distributable package.
+
+# VCS
+.git/
+.gitignore
+.gitattributes
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# CI
+.github/
+
+# Local scratch
+*.tmp
+*.bak
+*.orig

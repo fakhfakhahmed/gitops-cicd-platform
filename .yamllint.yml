@@ -1,0 +1,71 @@
+# yamllint configuration
+# ---------------------------------------------------------------------------
+# Run locally:  yamllint -c .yamllint.yml .
+# Run in CI:    .github/workflows/pr-validation.yml (job: yaml-lint)
+#
+# Philosophy: lint the YAML a human wrote, ignore the YAML a tool generates.
+# Helm templates are NOT YAML until they are rendered - they contain Go
+# template actions ({{ ... }}) that break any YAML parser - so they are
+# excluded here and validated instead by `helm lint` + `helm template |
+# kubeconform` which checks the *rendered* output against the real Kubernetes
+# OpenAPI schemas. That is a strictly stronger check.
+# ---------------------------------------------------------------------------
+
+extends: default
+
+ignore: |
+  charts/*/templates/
+  node_modules/
+  .git/
+  rendered/
+
+rules:
+  # 120 chars is a pragmatic limit: long image digests and Argo CD repo URLs
+  # genuinely do not fit in 80, and wrapping them hurts readability.
+  line-length:
+    max: 120
+    level: warning
+    allow-non-breakable-words: true
+    allow-non-breakable-inline-mappings: true
+
+  # Kubernetes manifests are conventionally written with a 2-space indent and
+  # sequences indented under their key. Enforce that consistently.
+  indentation:
+    spaces: 2
+    indent-sequences: consistent
+    check-multi-line-strings: false
+
+  # `on:` in a GitHub Actions workflow is parsed as the boolean `true` by
+  # YAML 1.1. That is correct per spec and GitHub handles it, so don't shout.
+  truthy:
+    allowed-values: ["true", "false", "on", "off"]
+    check-keys: false
+
+  # A leading `---` is good hygiene for multi-document files; require it so
+  # concatenating manifests is always safe.
+  document-start:
+    present: true
+
+  comments:
+    min-spaces-from-content: 1
+    require-starting-space: true
+
+  comments-indentation: enable
+
+  # Trailing newline at EOF, no trailing whitespace.
+  new-line-at-end-of-file: enable
+  trailing-spaces: enable
+
+  # Duplicate keys in a manifest are always a bug - a silently ignored field.
+  key-duplicates: enable
+
+  braces:
+    max-spaces-inside: 1
+  brackets:
+    max-spaces-inside: 1
+
+  # Allow empty values: `nodeSelector: {}` style placeholders are idiomatic in
+  # Helm values files and in Argo CD Application specs.
+  empty-values:
+    forbid-in-block-mappings: false
+    forbid-in-flow-mappings: false

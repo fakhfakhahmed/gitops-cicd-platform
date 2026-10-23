@@ -1,0 +1,51 @@
+{{- if .Values.podDisruptionBudget.enabled -}}
+---
+# policy/v1 - stable since Kubernetes 1.21. policy/v1beta1 was removed in 1.25.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "app.fullname" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  # ---------------------------------------------------------------------
+  # What a PDB actually does, and what it does not.
+  #
+  # It constrains VOLUNTARY disruptions only - evictions issued through the
+  # Eviction API:
+  #   * kubectl drain (node upgrade, decommission)
+  #   * cluster-autoscaler consolidating underused nodes
+  #   * node pool rolling upgrades in EKS/GKE/AKS
+  #   * descheduler rebalancing
+  #
+  # It does NOT protect against:
+  #   * a node kernel-panicking or losing power
+  #   * an OOMKill
+  #   * a bad rollout (that is maxUnavailable on the Deployment's strategy)
+  #   * someone running `kubectl delete pod`, which bypasses the Eviction API
+  #
+  # The classic self-inflicted wound: minAvailable == replicaCount. Now no pod
+  # may ever be evicted, `kubectl drain` hangs forever, and the on-call
+  # engineer doing a node upgrade at 3am has no idea why. Always leave room
+  # for at least one eviction: with 3 replicas, minAvailable 2.
+  # ---------------------------------------------------------------------
+  {{- if .Values.podDisruptionBudget.minAvailable }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- else if .Values.podDisruptionBudget.maxUnavailable }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  {{- end }}
+
+  {{- with .Values.podDisruptionBudget.unhealthyPodEvictionPolicy }}
+  # Kubernetes >= 1.27. Default is IfHealthyBudget, which refuses to evict
+  # a not-Ready pod unless the budget is currently satisfied. That sounds
+  # prudent but deadlocks on a workload that is already broken: a
+  # crashlooping Deployment can hold a node hostage and block a drain
+  # indefinitely. AlwaysAllow lets unhealthy pods be evicted regardless -
+  # they were not serving traffic anyway.
+  unhealthyPodEvictionPolicy: {{ . }}
+  {{- end }}
+
+  selector:
+    matchLabels:
+      {{- include "app.selectorLabels" . | nindent 6 }}
+{{- end }}

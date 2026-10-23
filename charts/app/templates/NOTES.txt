@@ -1,0 +1,59 @@
+{{- /*
+NOTES.txt is rendered to the terminal after `helm install`/`helm upgrade` and
+is also what `helm get notes <release>` prints later. Keep it accurate and
+copy-pasteable: this is the first thing a human (or a demo recording) sees
+after a deploy, so it is also useful LinkedIn-demo material.
+*/ -}}
+{{ include "app.fullname" . }} has been deployed to namespace {{ .Release.Namespace }}.
+
+Release:   {{ .Release.Name }}
+Revision:  {{ .Release.Revision }}
+Chart:     {{ .Chart.Name }}-{{ .Chart.Version }}
+Image:     {{ include "app.image" . }}
+
+{{- if .Values.ingress.enabled }}
+
+Ingress is enabled. The application should become reachable at:
+{{- range .Values.ingress.hosts }}
+  http://{{ .host }}{{ (index .paths 0).path }}
+{{- end }}
+
+On minikube, make sure the host resolves to the minikube IP:
+  minikube ip
+  # then add a hosts-file entry, e.g.
+  #   <minikube-ip>  {{ (index .Values.ingress.hosts 0).host }}
+{{- else }}
+
+Ingress is disabled. Reach the service from inside the cluster, or port-forward it:
+
+  kubectl --namespace {{ .Release.Namespace }} port-forward \
+    svc/{{ include "app.fullname" . }} 8080:{{ .Values.service.port }}
+
+Then:
+  curl http://localhost:8080/
+  curl http://localhost:8080/healthz
+  curl http://localhost:8080/readyz
+  curl http://localhost:8080/metrics
+{{- end }}
+
+Check rollout status:
+  kubectl --namespace {{ .Release.Namespace }} rollout status deployment/{{ include "app.fullname" . }}
+
+{{- if .Values.autoscaling.enabled }}
+
+Autoscaling is enabled ({{ .Values.autoscaling.minReplicas }}-{{ .Values.autoscaling.maxReplicas }} replicas).
+Requires metrics-server in the cluster, or HPA will report <unknown> targets:
+  kubectl --namespace {{ .Release.Namespace }} get hpa {{ include "app.fullname" . }}
+{{- end }}
+
+{{- if .Values.serviceMonitor.enabled }}
+
+A ServiceMonitor was created for Prometheus Operator scraping. If metrics do
+not appear in Prometheus, check that `serviceMonitor.labels` matches your
+Prometheus Operator's `serviceMonitorSelector`.
+{{- end }}
+
+Run the chart's built-in smoke test:
+  helm test {{ .Release.Name }} --namespace {{ .Release.Namespace }}
+
+{{ include "app.validateValues" . }}

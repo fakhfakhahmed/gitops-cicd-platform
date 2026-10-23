@@ -1,0 +1,64 @@
+---
+# The "app of apps" root. This is the ONLY Argo CD Application a human ever
+# applies by hand (via scripts/install-argocd or scripts/bootstrap). Every
+# other Application — app-dev, app-staging, app-prod, and anything the
+# ApplicationSet generates — is a Kubernetes manifest living under
+# gitops/applications/ and gitops/applicationset/, and this root Application
+# is what notices those files and creates them for you.
+#
+# The practical effect: adding a brand-new environment is a `git add` of one
+# YAML file, not a `kubectl apply` run by a human against a real cluster.
+# That single property is most of what "GitOps" buys you operationally.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root-app
+  namespace: argocd
+  # Protects this Application itself from `argocd app delete --cascade` or an
+  # accidental `kubectl delete` taking down every child Application with it.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+  labels:
+    app.kubernetes.io/part-of: gitops-cicd-platform
+spec:
+  project: gitops-platform
+
+  source:
+    repoURL: https://github.com/fakhfakhahmed/gitops-cicd-platform.git
+    targetRevision: main
+    path: gitops/applications
+    directory:
+      # Recurse so applicationset/ manifests under the same tree are also
+      # picked up if this path is ever pointed higher; kept false here since
+      # applications/ and applicationset/ are managed as separate concerns,
+      # but documented because it is the first thing people reach for when
+      # "I added a file and nothing happened" turns out to be this flag.
+      recurse: false
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+
+  syncPolicy:
+    automated:
+      # prune: child Applications removed from git are deleted from the
+      # cluster, not just orphaned. This is what makes "delete the file" the
+      # complete decommissioning procedure for an environment.
+      prune: true
+      # selfHeal: a child Application hand-edited with `kubectl edit` (or
+      # deleted outright) is restored to match git within one reconcile loop.
+      # This is the root Application enforcing GitOps on the Applications
+      # themselves, not just on workloads.
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # Apply objects in waves before checking the next wave's health, so the
+      # AppProject (which the child Applications reference) is guaranteed to
+      # exist before Argo CD tries to validate an Application against it.
+      - ApplyOutOfSyncOnly=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m

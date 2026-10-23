@@ -1,0 +1,133 @@
+---
+# Manual promotion: dev -> staging, or staging -> prod.
+#
+# Why workflow_dispatch and not "promote automatically N hours after dev
+# deploys": promotion is a decision, not a timer. Someone looked at dev (or
+# at staging), decided it is good, and is choosing to move it forward. This
+# workflow does not even touch the cluster — it only ever reads one values
+# file and writes another, then opens a PR. The actual deployment still goes
+# through Argo CD (automated for staging, manual-sync for prod).
+name: Promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_env:
+        description: Source environment to read the image tag from
+        required: true
+        type: choice
+        options: [dev, staging]
+      to_env:
+        description: Target environment to promote the tag to
+        required: true
+        type: choice
+        options: [staging, prod]
+
+concurrency:
+  group: promote-${{ github.event.inputs.from_env }}-${{ github.event.inputs.to_env }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate-inputs:
+    name: Validate promotion path
+    runs-on: ubuntu-latest
+    steps:
+      # Only two promotion paths are legal: dev->staging and staging->prod.
+      # "dev->prod" skipping staging, or a same-env no-op, would both be
+      # mistakes a human fat-fingering the workflow_dispatch form could make
+      # — reject them here instead of opening a nonsensical PR.
+      - name: Check promotion path is valid
+        run: |
+          FROM="${{ github.event.inputs.from_env }}"
+          TO="${{ github.event.inputs.to_env }}"
+          if [ "$FROM" = "dev" ] && [ "$TO" = "staging" ]; then exit 0; fi
+          if [ "$FROM" = "staging" ] && [ "$TO" = "prod" ]; then exit 0; fi
+          echo "::error::Invalid promotion path: ${FROM} -> ${TO}. Allowed: dev->staging, staging->prod."
+          exit 1
+
+  promote:
+    name: Open promotion PR
+    needs: validate-inputs
+    runs-on: ubuntu-latest
+    permissions:
+      # contents: write only to let the PR-creation action push a branch;
+      # pull-requests: write to open the PR itself. No cluster access, no
+      # package registry access — this job cannot deploy anything by itself.
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          fetch-depth: 1
+
+      - name: Install yq
+        run: |
+          curl -sSLo /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          chmod +x /usr/local/bin/yq
+
+      - name: Read source tag
+        id: source
+        run: |
+          set -euo pipefail
+          FROM="${{ github.event.inputs.from_env }}"
+          TAG=$(yq '.image.tag' "gitops/environments/${FROM}/values.yaml")
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "::error::No image.tag found in gitops/environments/${FROM}/values.yaml"
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Promoting tag ${TAG} from ${FROM} to ${{ github.event.inputs.to_env }}"
+
+      - name: Write target tag
+        run: |
+          set -euo pipefail
+          TO="${{ github.event.inputs.to_env }}"
+          yq -i ".image.tag = \"${{ steps.source.outputs.tag }}\"" \
+            "gitops/environments/${TO}/values.yaml"
+
+      # peter-evans/create-pull-request diffs the working tree against the
+      # base branch, commits only if something actually changed, pushes a
+      # branch, and opens (or updates, on re-run) the PR — idempotent by
+      # design, so re-running this workflow with the same inputs after
+      # nothing has changed is a safe no-op rather than a duplicate PR.
+      - uses: peter-evans/create-pull-request@c5a7806660adbe173f04e3e038b0ccdcd758773c # v7.0.5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: >-
+            chore(gitops): promote ${{ steps.source.outputs.tag }} to
+            ${{ github.event.inputs.to_env }}
+          branch: promote/${{ github.event.inputs.from_env }}-to-${{ github.event.inputs.to_env }}-${{ steps.source.outputs.tag }}
+          delete-branch: true
+          title: >-
+            chore(gitops): promote ${{ steps.source.outputs.tag }}
+            ${{ github.event.inputs.from_env }} -> ${{ github.event.inputs.to_env }}
+          labels: |
+            promotion
+            ${{ github.event.inputs.to_env }}
+          body: |
+            ## Promotion
+
+            | | |
+            |---|---|
+            | Image tag | `${{ steps.source.outputs.tag }}` |
+            | From | `${{ github.event.inputs.from_env }}` |
+            | To | `${{ github.event.inputs.to_env }}` |
+            | Triggered by | @${{ github.actor }} |
+
+            This PR updates `gitops/environments/${{ github.event.inputs.to_env }}/values.yaml`
+            only. Merging it updates **git**; it does **not** by itself deploy
+            anything.
+
+            - `staging` has `syncPolicy.automated` set — Argo CD deploys
+              within its next reconcile loop after this merges.
+            - `prod` is **manual sync** — after merging, a human must run
+              `argocd app sync app-prod` (or click Sync in the UI). See
+              [`docs/runbook.md`](../blob/main/docs/runbook.md).
+
+            Review checklist:
+            - [ ] The tag above matches what is currently healthy in `${{ github.event.inputs.from_env }}`
+            - [ ] No unrelated changes are included in this diff

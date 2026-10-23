@@ -1,0 +1,71 @@
+{{- if .Values.ingress.enabled -}}
+{{- $fullName := include "app.fullname" . -}}
+{{- $svcPort := .Values.service.port -}}
+---
+# networking.k8s.io/v1 - the only non-deprecated Ingress API. The older
+# extensions/v1beta1 and networking.k8s.io/v1beta1 were REMOVED in Kubernetes
+# 1.22, so a manifest using them does not warn, it fails outright with
+# "no matches for kind".
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  # ingressClassName replaces the old kubernetes.io/ingress.class annotation.
+  # The annotation still works in most controllers for backwards
+  # compatibility, but it is not part of the API, so nothing validates it -
+  # a typo there produces an Ingress that is simply ignored by every
+  # controller, with no error anywhere. The field is validated.
+  ingressClassName: {{ . }}
+  {{- end }}
+
+  {{- with .Values.ingress.tls }}
+  # Each entry maps a set of hosts to a Secret of type kubernetes.io/tls
+  # containing tls.crt and tls.key. The Secret MUST live in the same namespace
+  # as this Ingress - cross-namespace Secret references are not permitted, and
+  # the resulting failure mode is a controller serving its own default
+  # self-signed certificate while reporting no error at all.
+  #
+  # With cert-manager, adding the cluster-issuer annotation plus this block is
+  # enough: the certificate is requested, issued and renewed automatically.
+  tls:
+    {{- range . }}
+    - hosts:
+        {{- range .hosts }}
+        - {{ . | quote }}
+        {{- end }}
+      secretName: {{ .secretName }}
+    {{- end }}
+  {{- end }}
+
+  rules:
+    {{- range .Values.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            # pathType is MANDATORY in v1 and has no default.
+            #   Prefix - matches whole path segments. /api matches /api and
+            #            /api/v1 but NOT /apifoo. This is almost always what
+            #            you want.
+            #   Exact  - the path and nothing else, case sensitive.
+            #   ImplementationSpecific - delegates to the controller, which
+            #            makes the manifest behave differently on nginx vs
+            #            traefik vs an ALB. Avoid.
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: {{ $fullName }}
+                port:
+                  number: {{ $svcPort }}
+          {{- end }}
+    {{- end }}
+{{- end }}

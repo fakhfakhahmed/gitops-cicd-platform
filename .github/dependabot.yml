@@ -1,0 +1,73 @@
+---
+# Dependabot is what keeps every SHA pin in .github/workflows/*.yml current.
+# Every `uses:` line in this repo is pinned to a 40-character commit SHA with
+# a `# vX.Y.Z` comment (see docs/security.md for why floating tags like
+# `@v4` are a supply-chain risk) — that only stays maintainable because
+# Dependabot opens a PR with the new SHA and version comment every time an
+# action cuts a release, instead of a human tracking it by hand.
+version: 2
+updates:
+  # Go module updates for app/go.mod.
+  - package-ecosystem: gomod
+    directory: /app
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+      - go
+    open-pull-requests-limit: 10
+
+  # Base image updates for app/Dockerfile (both the builder and distroless
+  # runtime stages).
+  - package-ecosystem: docker
+    directory: /app
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+      - docker
+    open-pull-requests-limit: 5
+
+  # GitHub Actions used across every workflow in .github/workflows/. This is
+  # the one that matters most for supply-chain hygiene: it is what turns a
+  # SHA-pinned action from "frozen and eventually stale" into "frozen and
+  # kept current by a reviewable PR."
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+      - github-actions
+    open-pull-requests-limit: 10
+
+  # Helm chart dependencies, if charts/app ever declares any. Costs nothing
+  # to configure today even with an empty Chart.yaml dependencies list.
+  - package-ecosystem: docker
+    directory: /charts/app
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+      - helm
+    open-pull-requests-limit: 5

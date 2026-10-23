@@ -1,0 +1,48 @@
+# Everything excluded here stays out of the build context that gets shipped to
+# the Docker daemon / BuildKit. Two benefits:
+#   1. Speed - a smaller context uploads faster and invalidates fewer cache
+#      layers (a changed README should not rebuild the binary).
+#   2. Safety - a stray .env or kubeconfig in the working directory can never
+#      be accidentally COPY'd into a layer. Deleting a file in a later layer
+#      does NOT remove it from the image history; it is still extractable.
+
+# Build output
+bin/
+dist/
+*.exe
+*.test
+*.out
+coverage.*
+
+# Tests do not belong in the runtime image and are not needed to build it.
+# (They are run by the `test` job in CI, before the image is ever built.)
+*_test.go
+testdata/
+
+# VCS
+.git/
+.gitignore
+.github/
+
+# Docs and metadata
+*.md
+LICENSE
+docs/
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Secrets - defence in depth
+.env
+.env.*
+*.pem
+*.key
+kubeconfig*
+
+# The Dockerfile itself is not needed inside the context for the build
+Dockerfile
+.dockerignore

@@ -1,0 +1,514 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/fakhfakhahmed/gitops-cicd-platform/charts/app/values.schema.json",
+  "title": "app chart values",
+  "description": "JSON Schema for the gitops-cicd-platform `app` Helm chart. Helm validates the FULLY COALESCED values (defaults + every -f file + every --set) against this schema before rendering a single template. A type error or an unknown key therefore fails `helm template`, which fails CI, which means it never reaches a cluster. Without this file the same typo renders a syntactically valid but semantically wrong manifest and you discover it from a CrashLoopBackOff.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["image", "service", "resources"],
+
+  "properties": {
+    "global": {
+      "description": "Reserved by Helm for values shared with subcharts. Unused here, but it must be permitted or a parent chart could not set it.",
+      "type": "object"
+    },
+
+    "nameOverride": {
+      "description": "Replaces the chart name inside generated resource names.",
+      "type": "string",
+      "maxLength": 63
+    },
+
+    "fullnameOverride": {
+      "description": "Replaces the entire generated resource name, release prefix included.",
+      "type": "string",
+      "maxLength": 63
+    },
+
+    "replicaCount": {
+      "description": "Desired replica count. Ignored when autoscaling.enabled is true.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100
+    },
+
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository"],
+      "properties": {
+        "registry": {
+          "type": "string",
+          "minLength": 1
+        },
+        "repository": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z0-9]+(?:[._/-][a-z0-9]+)*$",
+          "description": "OCI repository path. Lowercase only: registries reject uppercase, and the error surfaces as an opaque 404 at pull time."
+        },
+        "tag": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^$|^[a-zA-Z0-9_][a-zA-Z0-9._-]*$",
+          "description": "Image tag. Empty falls back to Chart.appVersion. Must NOT start with a period or dash per the OCI tag grammar."
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^$|^sha256:[a-f0-9]{64}$",
+          "description": "Immutable content digest. When set it wins over tag. The regex is the point: a truncated or mistyped digest is rejected here instead of producing an ImagePullBackOff."
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"]
+        }
+      }
+    },
+
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    },
+
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "automount": {
+          "type": "boolean",
+          "description": "Mount the ServiceAccount API token into the pod. False unless the workload genuinely calls the Kubernetes API."
+        },
+        "annotations": { "type": "object" },
+        "name": { "type": "string", "maxLength": 253 }
+      }
+    },
+
+    "podAnnotations": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+
+    "podLabels": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+
+    "env": {
+      "description": "Application configuration, rendered into a ConfigMap and consumed via envFrom. Values MUST be strings: a ConfigMap's data field is map[string]string and an integer here renders invalid YAML.",
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "properties": {
+        "APP_ENV": { "type": "string", "minLength": 1 },
+        "LOG_LEVEL": {
+          "type": "string",
+          "enum": ["debug", "info", "warn", "error", "DEBUG", "INFO", "WARN", "ERROR"]
+        },
+        "READY_DELAY": { "type": "string", "pattern": "^[0-9]+(ns|us|ms|s|m|h)$" },
+        "PRESTOP_DELAY": { "type": "string", "pattern": "^[0-9]+(ns|us|ms|s|m|h)$" },
+        "SHUTDOWN_TIMEOUT": { "type": "string", "pattern": "^[0-9]+(ns|us|ms|s|m|h)$" },
+        "READ_TIMEOUT": { "type": "string", "pattern": "^[0-9]+(ns|us|ms|s|m|h)$" },
+        "WRITE_TIMEOUT": { "type": "string", "pattern": "^[0-9]+(ns|us|ms|s|m|h)$" },
+        "IDLE_TIMEOUT": { "type": "string", "pattern": "^[0-9]+(ns|us|ms|s|m|h)$" },
+        "MAX_BODY_BYTES": { "type": "string", "pattern": "^[0-9]+$" }
+      }
+    },
+
+    "extraEnv": {
+      "description": "Full EnvVar entries, so valueFrom (secretKeyRef, fieldRef, resourceFieldRef) is available.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "value": { "type": "string" },
+          "valueFrom": { "type": "object" }
+        },
+        "additionalProperties": false
+      }
+    },
+
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "strategy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["RollingUpdate", "Recreate"]
+            },
+            "rollingUpdate": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "maxSurge": { "type": ["integer", "string"] },
+                "maxUnavailable": { "type": ["integer", "string"] }
+              }
+            }
+          }
+        },
+        "revisionHistoryLimit": { "type": "integer", "minimum": 0, "maximum": 50 },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600,
+          "description": "Must exceed preStop seconds + PRESTOP_DELAY + SHUTDOWN_TIMEOUT or the kubelet SIGKILLs the pod mid-drain."
+        },
+        "minReadySeconds": { "type": "integer", "minimum": 0 },
+        "progressDeadlineSeconds": { "type": "integer", "minimum": 1 },
+        "priorityClassName": { "type": "string" }
+      }
+    },
+
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "preStop": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "type": {
+              "type": "string",
+              "enum": ["sleep", "httpGet", "none"],
+              "description": "`sleep` uses the native SleepAction (Kubernetes >= 1.30) because the distroless runtime image has no shell for the usual exec/sleep hook."
+            },
+            "seconds": { "type": "integer", "minimum": 0, "maximum": 600 },
+            "httpGetPath": { "type": "string", "pattern": "^/" }
+          }
+        }
+      }
+    },
+
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requests": { "$ref": "#/definitions/resourceQuantities" },
+        "limits": { "$ref": "#/definitions/resourceQuantities" }
+      }
+    },
+
+    "autoscaling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minReplicas": { "type": "integer", "minimum": 1 },
+        "maxReplicas": { "type": "integer", "minimum": 1 },
+        "targetCPUUtilizationPercentage": { "type": ["integer", "null"], "minimum": 1, "maximum": 100 },
+        "targetMemoryUtilizationPercentage": { "type": ["integer", "null"], "minimum": 1, "maximum": 100 },
+        "behavior": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "scaleUp": { "$ref": "#/definitions/hpaScalingRules" },
+            "scaleDown": { "$ref": "#/definitions/hpaScalingRules" }
+          }
+        }
+      }
+    },
+
+    "podDisruptionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minAvailable": { "type": ["integer", "string"] },
+        "maxUnavailable": { "type": ["integer", "string"] },
+        "unhealthyPodEvictionPolicy": {
+          "type": "string",
+          "enum": ["", "IfHealthyBudget", "AlwaysAllow"]
+        }
+      }
+    },
+
+    "podSecurityContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "runAsNonRoot": { "type": "boolean" },
+        "runAsUser": { "type": "integer", "minimum": 0 },
+        "runAsGroup": { "type": "integer", "minimum": 0 },
+        "fsGroup": { "type": "integer", "minimum": 0 },
+        "fsGroupChangePolicy": { "type": "string", "enum": ["Always", "OnRootMismatch"] },
+        "supplementalGroups": { "type": "array", "items": { "type": "integer" } },
+        "seccompProfile": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": {
+            "type": { "type": "string", "enum": ["RuntimeDefault", "Localhost", "Unconfined"] },
+            "localhostProfile": { "type": "string" }
+          }
+        }
+      }
+    },
+
+    "securityContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allowPrivilegeEscalation": { "type": "boolean" },
+        "readOnlyRootFilesystem": { "type": "boolean" },
+        "privileged": { "type": "boolean" },
+        "runAsNonRoot": { "type": "boolean" },
+        "runAsUser": { "type": "integer", "minimum": 0 },
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "add": { "type": "array", "items": { "type": "string" } },
+            "drop": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      }
+    },
+
+    "tmpDir": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Mount an emptyDir at /tmp. Required whenever securityContext.readOnlyRootFilesystem is true."
+        },
+        "sizeLimit": { "$ref": "#/definitions/quantity" }
+      }
+    },
+
+    "volumes": { "type": "array", "items": { "type": "object" } },
+    "volumeMounts": { "type": "array", "items": { "type": "object" } },
+
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["port", "targetPort"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["ClusterIP", "NodePort", "LoadBalancer", "ExternalName"]
+        },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "targetPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "nodePort": {
+          "type": ["integer", "string"],
+          "description": "Only honoured when type is NodePort. Valid range is the cluster's service-node-port-range, 30000-32767 by default."
+        },
+        "appProtocol": { "type": "string" },
+        "annotations": { "type": "object" }
+      }
+    },
+
+    "ingress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "className": { "type": "string" },
+        "annotations": { "type": "object" },
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["host", "paths"],
+            "properties": {
+              "host": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$",
+                "description": "RFC 1123 hostname. Lowercase only - an uppercase character is silently non-matching in most ingress controllers."
+              },
+              "paths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["path", "pathType"],
+                  "properties": {
+                    "path": { "type": "string", "pattern": "^/" },
+                    "pathType": {
+                      "type": "string",
+                      "enum": ["Prefix", "Exact", "ImplementationSpecific"],
+                      "description": "Mandatory in networking.k8s.io/v1 - there is no default."
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "tls": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["secretName"],
+            "properties": {
+              "secretName": { "type": "string", "minLength": 1 },
+              "hosts": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        }
+      }
+    },
+
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "liveness": { "$ref": "#/definitions/probe" },
+        "readiness": { "$ref": "#/definitions/probe" },
+        "startup": { "$ref": "#/definitions/probe" }
+      }
+    },
+
+    "topologySpreadConstraints": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["maxSkew", "topologyKey", "whenUnsatisfiable"],
+        "properties": {
+          "maxSkew": { "type": "integer", "minimum": 1 },
+          "topologyKey": { "type": "string", "minLength": 1 },
+          "whenUnsatisfiable": {
+            "type": "string",
+            "enum": ["DoNotSchedule", "ScheduleAnyway"]
+          },
+          "minDomains": { "type": "integer", "minimum": 1 },
+          "nodeAffinityPolicy": { "type": "string", "enum": ["Honor", "Ignore"] },
+          "nodeTaintsPolicy": { "type": "string", "enum": ["Honor", "Ignore"] },
+          "matchLabelKeys": { "type": "array", "items": { "type": "string" } },
+          "labelSelector": { "type": "object" }
+        }
+      }
+    },
+
+    "nodeSelector": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+
+    "tolerations": { "type": "array", "items": { "type": "object" } },
+
+    "affinity": { "type": "object" },
+
+    "serviceMonitor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Guarded because applying a ServiceMonitor without the Prometheus Operator CRD fails the entire Argo CD sync, not just this resource."
+        },
+        "interval": { "$ref": "#/definitions/prometheusDuration" },
+        "scrapeTimeout": { "$ref": "#/definitions/prometheusDuration" },
+        "path": { "type": "string", "pattern": "^/" },
+        "labels": { "type": "object", "additionalProperties": { "type": "string" } },
+        "honorLabels": { "type": "boolean" },
+        "relabelings": { "type": "array", "items": { "type": "object" } },
+        "metricRelabelings": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "ingressControllerNamespace": { "type": "string", "minLength": 1 },
+        "monitoringNamespace": { "type": "string", "minLength": 1 },
+        "allowDNS": { "type": "boolean" },
+        "dnsNamespace": { "type": "string", "minLength": 1 },
+        "allowAllEgress": { "type": "boolean" },
+        "extraIngress": { "type": "array", "items": { "type": "object" } },
+        "extraEgress": { "type": "array", "items": { "type": "object" } }
+      }
+    }
+  },
+
+  "definitions": {
+    "quantity": {
+      "type": ["string", "integer"],
+      "pattern": "^[0-9]+(\\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$",
+      "description": "A Kubernetes resource.Quantity. The pattern rejects the classic mistakes: `500MB` (not a valid suffix), `0.5Gi` is fine but `500 Mi` with a space is not."
+    },
+
+    "resourceQuantities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cpu": { "$ref": "#/definitions/quantity" },
+        "memory": { "$ref": "#/definitions/quantity" },
+        "ephemeral-storage": { "$ref": "#/definitions/quantity" }
+      }
+    },
+
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "path": { "type": "string", "pattern": "^/" },
+        "initialDelaySeconds": { "type": "integer", "minimum": 0 },
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "timeoutSeconds": { "type": "integer", "minimum": 1 },
+        "failureThreshold": { "type": "integer", "minimum": 1 },
+        "successThreshold": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Kubernetes rejects any value other than 1 for readiness and startup probes."
+        }
+      }
+    },
+
+    "hpaScalingRules": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "stabilizationWindowSeconds": { "type": "integer", "minimum": 0, "maximum": 3600 },
+        "selectPolicy": { "type": "string", "enum": ["Max", "Min", "Disabled"] },
+        "policies": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "value", "periodSeconds"],
+            "properties": {
+              "type": { "type": "string", "enum": ["Pods", "Percent"] },
+              "value": { "type": "integer", "minimum": 1 },
+              "periodSeconds": { "type": "integer", "minimum": 1, "maximum": 1800 }
+            }
+          }
+        }
+      }
+    },
+
+    "prometheusDuration": {
+      "type": "string",
+      "pattern": "^([0-9]+(ms|[smhdwy]))+$",
+      "description": "Prometheus duration literal, e.g. 30s, 1m, 2h30m. Note this grammar is NOT the same as a Go time.Duration string."
+    }
+  }
+}

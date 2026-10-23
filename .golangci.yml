@@ -1,0 +1,112 @@
+# golangci-lint configuration
+# ---------------------------------------------------------------------------
+# Run locally:  golangci-lint run ./...
+# Run in CI:    .github/workflows/ci.yml (job: lint)
+#
+# The linter set below is deliberately opinionated. Each entry is enabled
+# because it has caught a real class of production bug, not because it was in
+# the default list.
+# ---------------------------------------------------------------------------
+version: "2"
+
+run:
+  timeout: 5m
+  # The Go module lives in ./app, so point the tool at it from the repo root.
+  relative-path-mode: gomod
+  tests: true
+
+linters:
+  default: none
+  enable:
+    # --- correctness -------------------------------------------------------
+    - errcheck      # unchecked errors are the #1 source of silent failure
+    - govet         # catches printf mismatches, lost cancels, shadowed locks
+    - staticcheck   # the deepest static analysis available for Go
+    - ineffassign   # assignments that are never read
+    - unused        # dead code
+    - bodyclose     # unclosed HTTP response bodies leak file descriptors
+    - rowserrcheck  # sql.Rows.Err() forgotten
+    - nilerr        # `if err != nil { return nil }` - returns success on error
+    - errorlint     # %v on errors instead of %w breaks errors.Is/As chains
+
+    # --- security ----------------------------------------------------------
+    - gosec         # hardcoded creds, weak crypto, unhandled file perms
+
+    # --- style / maintainability ------------------------------------------
+    - revive        # golint successor, configurable
+    - misspell
+    - unconvert     # redundant type conversions
+    - prealloc      # slice preallocation in hot loops
+    - goconst       # repeated string literals that should be constants
+    - dupl          # copy-paste detection
+
+    # --- resource safety ---------------------------------------------------
+    - contextcheck  # functions that should accept a context but don't
+    - noctx         # HTTP requests built without a context cannot be cancelled
+
+  settings:
+    errcheck:
+      # Ignore the error from these - they cannot meaningfully fail and
+      # checking them adds noise. Everything else must be handled.
+      exclude-functions:
+        - (io.Closer).Close
+        - (net/http.ResponseWriter).Write
+
+    govet:
+      enable-all: true
+      disable:
+        # fieldalignment is a micro-optimisation that hurts struct readability
+        # for a service handling hundreds of requests/sec, not millions.
+        - fieldalignment
+
+    gosec:
+      excludes:
+        # G114: http.ListenAndServe without timeouts. We build an explicit
+        # http.Server WITH timeouts, so this fires as a false positive on the
+        # pattern match alone.
+        - G114
+
+    revive:
+      rules:
+        - name: exported
+          severity: warning
+        - name: package-comments
+          disabled: true
+        - name: indent-error-flow
+        - name: errorf
+        - name: context-as-argument
+        - name: var-naming
+
+    dupl:
+      threshold: 150
+
+    goconst:
+      min-len: 3
+      min-occurrences: 4
+
+  exclusions:
+    generated: lax
+    rules:
+      # Test files legitimately contain duplicated table rows, magic numbers
+      # and unchecked errors in fixtures. Linting them to production standards
+      # makes tests harder to read, which makes them worse tests.
+      - path: _test\.go
+        linters:
+          - dupl
+          - goconst
+          - gosec
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/fakhfakhahmed/gitops-cicd-platform
+
+issues:
+  # Report everything - a linter you silence is a linter you don't have.
+  max-issues-per-linter: 0
+  max-same-issues: 0

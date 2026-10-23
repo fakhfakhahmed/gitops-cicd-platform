@@ -1,0 +1,49 @@
+# EditorConfig - https://editorconfig.org
+# Keeps whitespace consistent across Windows / macOS / Linux contributors.
+# This matters more than it looks: a stray CRLF in a shell script or a Helm
+# template produces errors that are genuinely painful to debug inside a
+# container ("/bin/sh^M: bad interpreter").
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# Go has its own opinion and gofmt enforces it: tabs, always.
+[*.go]
+indent_style = tab
+indent_size = 4
+
+# Makefiles are whitespace-significant - recipe lines MUST start with a tab.
+[Makefile]
+indent_style = tab
+indent_size = 4
+
+[*.{yaml,yml}]
+indent_style = space
+indent_size = 2
+
+[*.{json,tpl}]
+indent_style = space
+indent_size = 2
+
+[*.md]
+# Markdown uses two trailing spaces for a hard line break, so don't strip them.
+trim_trailing_whitespace = false
+
+[*.sh]
+indent_style = space
+indent_size = 2
+end_of_line = lf
+
+# PowerShell on Windows tolerates LF, but the ISE and some signing tools
+# prefer CRLF. We keep CRLF here so the files behave natively on the host.
+[*.ps1]
+indent_style = space
+indent_size = 4
+end_of_line = crlf

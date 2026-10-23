@@ -1,0 +1,83 @@
+---
+# Helm chart metadata.
+#
+# apiVersion v2 is the Helm 3 format. v1 charts still install, but they cannot
+# express `dependencies` inline or `type: library`, and tooling increasingly
+# assumes v2. There is no reason to write a v1 chart in 2026.
+apiVersion: v2
+
+name: app
+description: >-
+  A production-shaped Helm chart for the gitops-cicd-platform demo service.
+  Ships a hardened Deployment (distroless, non-root, read-only root
+  filesystem), Service, Ingress, HPA, PodDisruptionBudget, NetworkPolicy and
+  an optional Prometheus ServiceMonitor. Values are validated against a JSON
+  Schema, so a typo fails at `helm template` time rather than at 3am.
+
+# `application` renders Kubernetes objects. The alternative, `library`, renders
+# nothing and exists only to be imported by other charts for its helpers.
+type: application
+
+# -----------------------------------------------------------------------------
+# Two versions, and they are NOT the same thing. This trips people up.
+# -----------------------------------------------------------------------------
+# version:    the version of THIS CHART - the packaging, the templates, the
+#             defaults. Bump it when you change a template or a default value,
+#             even if the application code is untouched.
+#
+# appVersion: the default version of the APPLICATION the chart deploys. It is
+#             the fallback for the image tag and it is what appears in
+#             `helm list`. Bump it when the app changes.
+#
+# They move independently. Adding a NetworkPolicy template bumps `version`
+# only. Shipping a new build of the Go service bumps `appVersion` only.
+#
+# In this repo appVersion is mostly advisory: the deployed tag is pinned per
+# environment in gitops/environments/<env>/values.yaml and rewritten by CI, so
+# that git — not the chart — is the source of truth for what is running where.
+# -----------------------------------------------------------------------------
+version: 0.1.0
+appVersion: "0.1.0"
+
+# kubeVersion gates installation on cluster capability. The floor is 1.25
+# because this chart uses:
+#   * autoscaling/v2          (stable in 1.23)
+#   * policy/v1 PDB           (stable in 1.21)
+#   * seccompProfile in the pod spec (GA in 1.19)
+#   * PodSecurity admission "restricted" labels (stable in 1.25)
+# Helm refuses to install if the target cluster is older, which is a much
+# better error than a cryptic "no matches for kind".
+kubeVersion: ">=1.25.0-0"
+
+home: https://github.com/fakhfakhahmed/gitops-cicd-platform
+
+sources:
+  - https://github.com/fakhfakhahmed/gitops-cicd-platform
+  - https://github.com/fakhfakhahmed/gitops-cicd-platform/tree/main/app
+
+maintainers:
+  - name: Ahmed Fakhfakh
+    url: https://github.com/fakhfakhahmed
+
+keywords:
+  - gitops
+  - argocd
+  - cicd
+  - github-actions
+  - kubernetes
+  - devops
+  - platform-engineering
+  - supply-chain-security
+  - observability
+
+annotations:
+  # artifacthub.io/* annotations are read by Artifact Hub if the chart is ever
+  # published there. They cost nothing and make the chart self-describing.
+  artifacthub.io/license: MIT
+  artifacthub.io/operator: "false"
+  artifacthub.io/prerelease: "false"
+  artifacthub.io/changes: |
+    - kind: added
+      description: Initial chart with hardened Deployment, HPA, PDB and NetworkPolicy
+    - kind: added
+      description: values.schema.json for fail-fast values validation

@@ -1,0 +1,77 @@
+---
+name: Bug report
+description: Something in the app, chart, or pipeline is broken.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. The more specific the
+        reproduction, the faster it gets fixed.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where is the bug?
+      options:
+        - Application (app/)
+        - Helm chart (charts/)
+        - GitOps config (gitops/)
+        - CI/CD workflow (.github/workflows/)
+        - Scripts (scripts/)
+        - Documentation
+        - Something else
+    validations:
+      required: true
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment (if applicable)
+      options:
+        - dev
+        - staging
+        - prod
+        - local (minikube)
+        - N/A
+    validations:
+      required: false
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did you actually see?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run `scripts/bootstrap.ps1`
+        2. ...
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / output
+      description: |
+        Paste `kubectl logs`, `argocd app get`, or GitHub Actions run output.
+        This field renders as a code block automatically.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+    validations:
+      required: false

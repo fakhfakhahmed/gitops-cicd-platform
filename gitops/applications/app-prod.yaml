@@ -1,0 +1,76 @@
+---
+# Production Application: MANUAL SYNC. This is the one deliberate exception
+# to "everything is automated" in the whole repo, and it is deliberate for a
+# specific reason, not timidity:
+#
+#   Automated sync + selfHeal means "whatever is in git becomes the cluster
+#   state, unattended." For dev and staging that is exactly the point. For
+#   production, git becoming production *mid-change* — at 2am, because a
+#   promotion PR merged while an operator wasn't watching, or because
+#   selfHeal reverted an emergency `kubectl scale` during an actual
+#   incident — is a real production incident waiting to happen.
+#
+# Argo CD still WATCHES prod continuously and reports Synced/OutOfSync/
+# Degraded in real time either way; automated vs manual only controls
+# whether it ACTS on that observation by itself. A human runs
+# `argocd app sync app-prod` (or clicks Sync in the UI) once they have looked
+# at the diff. See docs/gitops.md and LEARN.md's "why is your production app
+# manual-sync" interview answer for the full reasoning.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-prod
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: gitops-cicd-platform
+    env: prod
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: gitops-platform
+
+  sources:
+    - repoURL: https://github.com/fakhfakhahmed/gitops-cicd-platform.git
+      targetRevision: main
+      path: charts/app
+      helm:
+        valueFiles:
+          - $values/gitops/environments/prod/values.yaml
+    - repoURL: https://github.com/fakhfakhahmed/gitops-cicd-platform.git
+      targetRevision: main
+      ref: values
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: app-prod
+
+  # NOTE: no `automated:` block at all. An empty/absent automated policy is
+  # how Argo CD represents manual sync — there is no explicit `manual: true`
+  # flag. Self-heal is therefore also off (it is a property of the automated
+  # policy), which is intentional: prod only ever changes when a human says
+  # so, full stop.
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true
+      - PrunePropagationPolicy=foreground
+    retry:
+      limit: 3
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m
+
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
+
+  # Longer history in prod: this is the pool `argocd app rollback` or
+  # `argocd app history` draws from during an incident, and prod is where
+  # you most want several good-known-states to pick from.
+  revisionHistoryLimit: 20

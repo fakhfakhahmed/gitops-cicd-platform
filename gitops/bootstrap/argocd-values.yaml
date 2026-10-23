@@ -1,0 +1,107 @@
+---
+# Helm values for the upstream `argo-cd` chart (argoproj/argo-helm), used by
+# scripts/install-argocd. Pinned here, in git, for the same reason every
+# other value in this repo is pinned here: `helm install argo-cd argo/argo-cd
+# --set server.insecure=true` is a command nobody can diff or review.
+#
+# Scope: this is a LOCAL / DEMO configuration for a minikube cluster reached
+# via `kubectl port-forward`. It deliberately trades TLS and HA for a
+# one-command bootstrap. See the "production" notes inline for what changes
+# on a real cluster.
+
+global:
+  # Modest resource floor so Argo CD's own pods don't starve the two-node
+  # minikube cluster this whole repo is designed to run comfortably on.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+configs:
+  params:
+    # server.insecure disables TLS on the argocd-server Service and makes it
+    # speak plain HTTP. This is ONLY acceptable because access is exclusively
+    # via `kubectl port-forward` (traffic never leaves the trusted local
+    # machine / cluster boundary). On a real cluster, terminate TLS at an
+    # Ingress with cert-manager instead and remove this flag entirely.
+    server.insecure: true
+
+  cm:
+    # Argo CD's own "admin" label: shown in the UI footer, harmless, but a
+    # nice fingerprint that this instance was provisioned by this repo.
+    application.instanceLabelKey: argocd.argoproj.io/instance
+    # Shortens the UI's default timeout for `kubectl diff`-style live
+    # manifest comparisons; the default is generous for huge clusters, this
+    # one has a handful of resources.
+    timeout.reconciliation: 180s
+
+  rbac:
+    # Default policy: authenticated-but-unmapped users get read-only access
+    # rather than the (looser) built-in "role:readonly" ambiguity. Explicit
+    # beats implicit for an RBAC default.
+    policy.default: role:readonly
+    policy.csv: |
+      # The admin user (local, see `scripts/install-argocd` for how the
+      # initial password is retrieved) is the only write-capable identity in
+      # this demo setup. A real deployment would map SSO groups here instead
+      # of relying on the static admin account at all.
+      p, role:admin, applications, *, */*, allow
+      p, role:admin, clusters, *, *, allow
+      p, role:admin, repositories, *, *, allow
+      g, admin, role:admin
+
+server:
+  # A single replica is correct for a laptop demo cluster. Production Argo CD
+  # runs server/repo-server/application-controller each with >=2 replicas and
+  # redis in HA mode; see docs/architecture.md for what changes operating at
+  # fleet scale.
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+repoServer:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+applicationSet:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+controller:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+redis:
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+
+notifications:
+  # Not wired to a real receiver in this demo (no Slack webhook to ship in a
+  # public repo). Left enabled with the default controller so the CRDs and
+  # templates install cleanly; see docs/runbook.md for how to point it at a
+  # real webhook.
+  enabled: true

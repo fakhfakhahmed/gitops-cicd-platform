@@ -1,0 +1,127 @@
+---
+# Production environment overlay.
+#
+# `image.tag` changes ONLY via a promotion PR (staging -> prod) reviewed and
+# merged by a human, and that merge only updates GIT — the cluster itself
+# does not move until someone runs `argocd app sync app-prod`, because
+# gitops/applications/app-prod.yaml deliberately has no `syncPolicy.automated`
+# block. Two independent gates (PR review, then manual sync) stand between
+# "a build exists" and "production is running it". See docs/gitops.md.
+#
+# Goal for prod: resilient to a single node failure, protected from
+# over-aggressive voluntary disruption, strict on resource usage, and fully
+# observable.
+
+replicaCount: 3
+
+image:
+  # updated by the promotion PR (promote.yml) — merging the PR does not
+  # deploy anything by itself; see spec.syncPolicy in app-prod.yaml.
+  tag: "main"
+
+env:
+  APP_ENV: "prod"
+  # info, not debug: prod logs are shipped and billed by volume. Debug-level
+  # request-by-request logging here would both cost real money and bury the
+  # warnings/errors that actually matter for on-call.
+  LOG_LEVEL: "info"
+  READY_DELAY: "2s"
+  PRESTOP_DELAY: "5s"
+  SHUTDOWN_TIMEOUT: "15s"
+  READ_TIMEOUT: "10s"
+  WRITE_TIMEOUT: "30s"
+  IDLE_TIMEOUT: "120s"
+  MAX_BODY_BYTES: "1048576"
+
+# Tighter, explicit resource envelope than the chart default. In prod the
+# cost of under-provisioning (latency, OOMKills under real traffic) and
+# over-provisioning (wasted spend across many replicas) both actually matter,
+# so these numbers are deliberate rather than the laptop-friendly defaults.
+resources:
+  requests:
+    cpu: 100m
+    memory: 96Mi
+  limits:
+    memory: 192Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# minAvailable: 2 out of a floor of 3 replicas means at most one pod may ever
+# be voluntarily evicted at a time (node drain, cluster-autoscaler
+# scale-down, kubectl drain) — the service never drops below 2/3 capacity
+# from a VOLUNTARY disruption. Deliberately not "replicaCount - 0" (see the
+# warning in charts/app/values.yaml about minAvailable == replicaCount
+# blocking drains forever).
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+# Spreads the 3+ replicas across nodes (and, on a real multi-zone cluster,
+# across zones) so a single node failure — which NO PodDisruptionBudget can
+# prevent, because it is involuntary — takes out at most one replica instead
+# of all of them landing on the one node that happened to reboot.
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: app
+        app.kubernetes.io/instance: app-prod
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    # DoNotSchedule here is intentionally stricter than the hostname spread
+    # above: a single-zone minikube/demo cluster would leave pods Pending
+    # forever under DoNotSchedule on zone, so this is written for a real
+    # multi-zone cluster. A single-node demo cluster should keep
+    # autoscaling.enabled low enough (or this block commented) to avoid
+    # Pending pods — see docs/runbook.md.
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: app
+        app.kubernetes.io/instance: app-prod
+
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+  hosts:
+    - host: app.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: app-prod-tls
+      hosts:
+        - app.example.com
+
+serviceMonitor:
+  enabled: true
+  interval: 15s
+  scrapeTimeout: 10s
+  labels:
+    # Matches a Prometheus Operator installed with the common
+    # kube-prometheus-stack release name. Mismatch here is the #1 reason a
+    # ServiceMonitor is created and never scraped — see docs/runbook.md.
+    release: kube-prometheus-stack
+
+networkPolicy:
+  enabled: true
+  ingressControllerNamespace: ingress-nginx
+  monitoringNamespace: monitoring
+  allowDNS: true
+  dnsNamespace: kube-system
+  # Production is the environment where "allow all egress" stops being
+  # acceptable in a non-demo setting; left true here only because this repo
+  # has no real external dependency to scope it to. A real prod rollout would
+  # replace this with `extraEgress` CIDR/port rules for the actual
+  # dependency list (database, object storage, third-party APIs).
+  allowAllEgress: true

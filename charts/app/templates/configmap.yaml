@@ -1,0 +1,38 @@
+{{/*
+Application configuration as a ConfigMap.
+
+Why a ConfigMap rather than inline `env:` entries on the container:
+
+  1. It is independently inspectable. `kubectl get cm <release>-app-config -o
+     yaml` shows the effective config of a running workload without having to
+     read through a Deployment spec.
+  2. It gives the checksum/config annotation in deployment.yaml something to
+     hash, which is what makes a config-only change produce a real rolling
+     update instead of a silent no-op.
+  3. Argo CD renders it as its own node in the resource tree, so a config
+     change is visible as a diff on a small object rather than buried in a
+     200-line Deployment diff.
+
+What does NOT belong here: anything secret. A ConfigMap is stored in plain
+text in etcd and is readable by anyone with get-configmap RBAC in the
+namespace. Secrets go in a Secret, and in a real deployment they come from
+external-secrets or sealed-secrets - never from a values file in git.
+*/}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "app.configMapName" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+data:
+  {{- /*
+    A ConfigMap's `data` is map[string]string. Every value is piped through
+    `quote` so that an unquoted `LOG_LEVEL: info` stays a string, and more
+    importantly so YAML 1.1 truthiness cannot bite: an unquoted `yes`, `no`,
+    `on` or `off` would be parsed as a boolean and rejected by the API server
+    with "cannot unmarshal bool into string".
+  */ -}}
+  {{- range $key, $value := .Values.env }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}

@@ -1,0 +1,595 @@
+---
+# =============================================================================
+# Default values for the `app` chart.
+# =============================================================================
+# These defaults are deliberately SAFE rather than PRODUCTION-SIZED: the chart
+# installs cleanly on a laptop minikube with no overrides, and each environment
+# layers its own file on top from gitops/environments/<env>/values.yaml.
+#
+# Values precedence, lowest to highest:
+#   1. this file
+#   2. a parent chart's values (not used here - this chart has no parents)
+#   3. -f / --values files, in the order given (later files win)
+#   4. --set / --set-string / --set-json on the command line
+#
+# Argo CD passes the environment overlay as (3). Nothing uses (4), on purpose:
+# --set is imperative, invisible to git, and therefore not reproducible.
+#
+# Every value here is validated by values.schema.json. A typo such as
+# `replicaCount: "3"` (a string) or `autoscaling.minReplicas: 0` fails at
+# `helm template` time, which means it fails in CI, which means it never
+# reaches a cluster.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Naming
+# -----------------------------------------------------------------------------
+# nameOverride replaces the chart name inside the generated resource names.
+# fullnameOverride replaces the whole generated name, release prefix included.
+# Both default to empty, which yields "<release>-app" (truncated to 63 chars,
+# the Kubernetes label-value limit).
+nameOverride: ""
+fullnameOverride: ""
+
+# -----------------------------------------------------------------------------
+# Image
+# -----------------------------------------------------------------------------
+image:
+  registry: ghcr.io
+  repository: fakhfakhahmed/gitops-cicd-platform/app
+
+  # tag is intentionally empty here. Leaving it blank makes the chart fall back
+  # to Chart.appVersion, so `helm install` on a fresh clone works. In the real
+  # deployment path the tag is pinned per environment and rewritten by CI:
+  #   gitops/environments/dev/values.yaml      <- written automatically on merge
+  #   gitops/environments/staging/values.yaml  <- written by the promote PR
+  #   gitops/environments/prod/values.yaml     <- written by the promote PR
+  tag: ""
+
+  # digest wins over tag when set: ghcr.io/.../app@sha256:abcd...
+  #
+  # A tag is a mutable pointer. Someone with push rights can move `v1.2.3` to a
+  # different image and every pod that restarts afterwards silently runs
+  # different code. A digest is the content hash - it cannot be moved. Pinning
+  # by digest is what makes "the image we scanned and signed" and "the image
+  # that is running" provably the same artifact.
+  #
+  # The trade-off is readability: a digest tells a human nothing. The pattern
+  # used here is to set BOTH - the tag for humans, the digest for the machine -
+  # and let the deployment template prefer the digest.
+  digest: ""
+
+  # IfNotPresent avoids a registry round-trip on every pod start. It is safe
+  # precisely because tags are immutable in this pipeline (each build gets a
+  # unique sha-<commit> tag). Use Always only if you insist on mutable tags,
+  # and accept that you have given up on knowing what is running.
+  pullPolicy: IfNotPresent
+
+# Secrets used to pull from a private registry. GHCR packages inherit the
+# repository's visibility: a public repo needs nothing here. For a private
+# package, create a docker-registry secret and reference it:
+#   imagePullSecrets:
+#     - name: ghcr-pull-secret
+imagePullSecrets: []
+
+# -----------------------------------------------------------------------------
+# Replicas
+# -----------------------------------------------------------------------------
+# Ignored when autoscaling.enabled is true - see the note in templates/
+# deployment.yaml about why the template omits `replicas` entirely in that
+# case rather than setting it.
+replicaCount: 2
+
+# -----------------------------------------------------------------------------
+# Service account
+# -----------------------------------------------------------------------------
+serviceAccount:
+  # A dedicated ServiceAccount per workload, even one that calls no Kubernetes
+  # API. Sharing `default` means any RoleBinding ever granted to `default`
+  # silently applies to this workload too.
+  create: true
+
+  # automount: false is the important line. By default Kubernetes mounts a
+  # projected ServiceAccount token at
+  # /var/run/secrets/kubernetes.io/serviceaccount/token in every container.
+  # Our app never calls the API server, so that token is pure downside: an
+  # attacker with RCE gets a cluster credential for free. Turning it off costs
+  # nothing and removes an entire escalation path.
+  automount: false
+
+  annotations: {}
+  # Leave empty to use the generated fullname.
+  name: ""
+
+# -----------------------------------------------------------------------------
+# Pod metadata
+# -----------------------------------------------------------------------------
+# Extra annotations merged onto the pod template. The chart always adds a
+# checksum of the ConfigMap here (see deployment.yaml) so a config-only change
+# triggers a rollout.
+podAnnotations: {}
+
+podLabels: {}
+
+# -----------------------------------------------------------------------------
+# Application configuration
+# -----------------------------------------------------------------------------
+# These become a ConfigMap, consumed by the container via envFrom. Putting them
+# in a ConfigMap rather than inline `env:` entries is what makes the
+# checksum/config annotation possible: Helm hashes the rendered ConfigMap and
+# stamps the hash on the pod template, so changing a log level produces a new
+# pod spec and therefore a real rolling update. With inline env this still
+# works, but the ConfigMap is also independently inspectable with
+# `kubectl get cm -o yaml`, which is handy at 3am.
+#
+# All values must be strings - a ConfigMap's data map is map[string]string, and
+# `LOG_LEVEL: 5` (an int) makes Helm render invalid YAML.
+env:
+  APP_ENV: "dev"
+  LOG_LEVEL: "info"
+  # Warm-up window before the pod reports ready.
+  READY_DELAY: "2s"
+  # Lame-duck window after SIGTERM, before the listener closes. MUST be less
+  # than terminationGracePeriodSeconds minus SHUTDOWN_TIMEOUT.
+  PRESTOP_DELAY: "5s"
+  SHUTDOWN_TIMEOUT: "15s"
+  READ_TIMEOUT: "10s"
+  WRITE_TIMEOUT: "30s"
+  IDLE_TIMEOUT: "120s"
+  MAX_BODY_BYTES: "1048576"
+
+# extraEnv takes FULL env entries, so it can use valueFrom - secretKeyRef,
+# fieldRef, resourceFieldRef - which a plain ConfigMap cannot express.
+# The chart already injects POD_NAME, POD_NAMESPACE and NODE_NAME via the
+# downward API; add your own here.
+#
+# extraEnv:
+#   - name: DATABASE_PASSWORD
+#     valueFrom:
+#       secretKeyRef:
+#         name: app-db
+#         key: password
+extraEnv: []
+
+# -----------------------------------------------------------------------------
+# Deployment behaviour
+# -----------------------------------------------------------------------------
+deployment:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # maxUnavailable: 0 + maxSurge: 1 is the conservative, correct default:
+      # capacity never dips below the declared replica count during a rollout.
+      # A new pod is created, becomes Ready, joins the Service, and only then
+      # is an old pod terminated. The cost is one extra pod's worth of
+      # resources for the duration of the rollout.
+      #
+      # The common mistake is maxUnavailable: 1 on a 2-replica deployment:
+      # you drop to 50% capacity mid-deploy, and if the new pod crashloops you
+      # are serving at half capacity until someone notices.
+      maxSurge: 1
+      maxUnavailable: 0
+
+  # How many old ReplicaSets to keep. Each one is a rollback target for
+  # `kubectl rollout undo`. Keep enough to roll back past a bad deploy, few
+  # enough that `kubectl get rs` stays readable.
+  #
+  # Note: in a GitOps world `kubectl rollout undo` is the WRONG rollback - it
+  # makes the cluster diverge from git and Argo CD will revert your rollback
+  # within seconds via self-heal. The real rollback is `git revert`. These
+  # ReplicaSets are for forensics, not for recovery. See docs/runbook.md.
+  revisionHistoryLimit: 5
+
+  # The kubelet's hard budget for shutdown. After this it sends SIGKILL.
+  # It must exceed preStop + PRESTOP_DELAY + SHUTDOWN_TIMEOUT, or we get
+  # killed mid-drain and the whole graceful shutdown dance was pointless.
+  #   5s (preStop hook) + 5s (app lame duck) + 15s (drain) = 25s, so 45s
+  #   leaves real headroom.
+  terminationGracePeriodSeconds: 45
+
+  # A pod must stay Ready for this long before the rollout counts it as
+  # available and proceeds to the next one. This is the cheapest possible
+  # guard against a pod that passes its first readiness check and then dies:
+  # without it, a rollout can replace every replica with a broken one in
+  # seconds because each was briefly "Ready".
+  minReadySeconds: 5
+
+  # Deadline for the whole rollout. If it has not progressed within this
+  # window the Deployment is marked Failed, which is what Argo CD watches to
+  # report the Application as Degraded instead of hanging on Progressing
+  # forever.
+  progressDeadlineSeconds: 600
+
+  priorityClassName: ""
+
+# -----------------------------------------------------------------------------
+# Container lifecycle
+# -----------------------------------------------------------------------------
+lifecycle:
+  preStop:
+    enabled: true
+
+    # IMPORTANT, and the detail most charts get wrong:
+    #
+    # The idiomatic preStop hook you see everywhere is
+    #   exec: { command: ["/bin/sh", "-c", "sleep 5"] }
+    # That CANNOT work here. Our runtime image is distroless - there is no
+    # /bin/sh, no sleep, no busybox. The hook fails, the kubelet logs
+    # FailedPreStopHook, and the drain window you thought you had does not
+    # exist. You then spend a morning wondering why deploys drop connections.
+    #
+    # Options that actually work with a shell-less image:
+    #   "sleep"   - the native SleepAction (Kubernetes >= 1.30; beta and on by
+    #               default from 1.29). No shell required. This is the answer.
+    #   "httpGet" - hit our own /healthz; costs a round-trip but works on any
+    #               version. Use on clusters older than 1.29.
+    #   "none"    - rely purely on the app's own SIGTERM handling, which does
+    #               the same lame-duck wait internally (PRESTOP_DELAY). This is
+    #               genuinely safe here because we wrote the app; it would not
+    #               be safe for an off-the-shelf image.
+    type: sleep
+    seconds: 5
+    # Only used when type is httpGet.
+    httpGetPath: /healthz
+
+# -----------------------------------------------------------------------------
+# Resources
+# -----------------------------------------------------------------------------
+# requests  = what the scheduler reserves. Too low and you get packed onto a
+#             node with no headroom; too high and you waste cluster capacity.
+# limits    = the hard ceiling the kernel enforces.
+#
+# MEMORY has both, and they are equal. Memory is incompressible: a process that
+# exceeds its limit is OOMKilled, it cannot be "slowed down". Setting
+# request == limit puts the pod in the Guaranteed QoS class, which makes it the
+# LAST thing evicted when a node runs out of memory.
+#
+# CPU has a request but NO limit, and that is deliberate.
+# A CPU limit is enforced by the Linux CFS quota: the cgroup gets N
+# microseconds of CPU per 100ms period, and when it runs out, every thread is
+# frozen until the next period. For a latency-sensitive HTTP service this
+# produces throttling spikes in the p99 even when average utilisation is low -
+# a GC cycle or a burst of concurrent requests briefly needs more than the
+# quota and the whole process stalls for milliseconds. The request already
+# guarantees a share under contention; the limit only adds a way to be slow for
+# no reason. Omitting it lets the pod use idle CPU for free.
+#
+# (Caveat worth knowing for interviews: dropping the CPU limit moves the pod
+# from Guaranteed to Burstable QoS. For memory-pressure eviction, Burstable
+# with memory request == limit still ranks very favourably, so the trade is
+# worth it. If your cluster policy mandates Guaranteed, set a CPU limit
+# generously - 3-4x the request - rather than tightly.)
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 128Mi
+
+# -----------------------------------------------------------------------------
+# Horizontal Pod Autoscaler (autoscaling/v2)
+# -----------------------------------------------------------------------------
+# Requires metrics-server in the cluster. Without it the HPA reports
+# "unknown" for every metric and never scales - see docs/runbook.md.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+
+  # Target 70% CPU, not 90%. The HPA reacts on a 15s loop and new pods need
+  # time to start and warm up; if you only begin scaling at 90% you are
+  # already saturated by the time capacity arrives.
+  targetCPUUtilizationPercentage: 70
+
+  # Memory-based scaling is a weak signal for a Go service - the runtime holds
+  # on to freed memory, so utilisation is sticky and rarely drops. It is here
+  # as a safety net against a slow leak, set high enough not to fight the GC.
+  targetMemoryUtilizationPercentage: 80
+
+  # behavior (autoscaling/v2) controls the scaling *rate*, which is what stops
+  # an HPA from oscillating.
+  behavior:
+    scaleUp:
+      # React to load immediately. There is no stabilisation window because
+      # being slow to add capacity during a spike is the failure we care about.
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100        # at most double the replica count...
+          periodSeconds: 30 # ...every 30 seconds
+        - type: Pods
+          value: 4          # or add 4 pods, whichever is larger
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      # Scale DOWN slowly. A 5-minute window means the HPA looks at the
+      # highest recommendation from the last 300 seconds before shrinking, so
+      # a brief dip in traffic cannot trigger a removal that is immediately
+      # undone. Flapping replicas means constant connection churn.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+      selectPolicy: Min
+
+# -----------------------------------------------------------------------------
+# PodDisruptionBudget (policy/v1)
+# -----------------------------------------------------------------------------
+# A PDB constrains VOLUNTARY disruptions only: `kubectl drain`, cluster
+# autoscaler scale-down, node pool upgrades. It does NOT protect against a
+# node catching fire, an OOMKill, or a bad rollout - those are involuntary and
+# no API object can prevent them.
+#
+# Set exactly one of minAvailable / maxUnavailable. Leave the other empty.
+#
+# The classic self-inflicted outage: minAvailable equal to replicaCount. Now
+# zero pods may ever be evicted, `kubectl drain` blocks forever, and your node
+# upgrade hangs at 3am. Always leave room for at least one eviction.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  maxUnavailable: ""
+
+  # Kubernetes >= 1.27. "AlwaysAllow" permits eviction of pods that are not
+  # yet Ready, which unblocks a drain when the workload is already broken -
+  # otherwise a crashlooping deployment can hold a node hostage indefinitely.
+  # Leave empty to use the cluster default (IfHealthyBudget).
+  unhealthyPodEvictionPolicy: ""
+
+# -----------------------------------------------------------------------------
+# Security context
+# -----------------------------------------------------------------------------
+# Pod-level: applies to every container and to volume ownership.
+podSecurityContext:
+  # The kubelet refuses to start the container if the image's configured user
+  # resolves to UID 0. This is enforcement, not a hint - it is what turns
+  # "we built a non-root image" into "a non-root image is the only thing that
+  # can run here", even if someone later swaps the image reference.
+  runAsNonRoot: true
+
+  # 65532 is `nonroot` in the distroless base image. Stated explicitly so the
+  # pod spec is self-describing and so it still works if the base image ever
+  # changes its default.
+  runAsUser: 65532
+  runAsGroup: 65532
+
+  # fsGroup sets group ownership on mounted volumes so a non-root process can
+  # write to them. Required for the /tmp emptyDir below to be usable.
+  fsGroup: 65532
+
+  seccompProfile:
+    # RuntimeDefault applies the container runtime's seccomp filter, blocking
+    # roughly 44 of the ~300 Linux syscalls - the ones no normal application
+    # needs and most container escapes rely on (keyctl, ptrace, mount, pivot_
+    # root, bpf, userfaultfd...). Without this line, the pod runs with seccomp
+    # UNCONFINED: every syscall in the kernel is reachable.
+    #
+    # This single field is probably the highest security-value-per-character
+    # in the entire chart.
+    type: RuntimeDefault
+
+# Container-level: these override and narrow the pod-level settings.
+securityContext:
+  # Blocks setuid binaries and file capabilities from granting more privilege
+  # than the parent process had. Closes the classic `sudo`/setuid escape even
+  # if one were somehow present in the image.
+  allowPrivilegeEscalation: false
+
+  # The whole filesystem is mounted read-only. An attacker cannot drop a
+  # webshell, a crypto miner, or a modified binary - there is nowhere to write
+  # it. It also catches our own bugs: a stray log-to-file would fail loudly in
+  # dev instead of silently filling a node's disk in prod.
+  #
+  # The cost: anything that genuinely needs scratch space needs an explicit
+  # emptyDir, which is why tmpDir below exists. Go's os.CreateTemp, the TLS
+  # session cache and most libraries assume a writable /tmp. Forgetting that
+  # mount is the #1 cause of CrashLoopBackOff when turning this flag on - see
+  # docs/runbook.md.
+  readOnlyRootFilesystem: true
+
+  privileged: false
+
+  capabilities:
+    # Drop every Linux capability. A plain HTTP server listening on 8080 needs
+    # none of them - NET_BIND_SERVICE is only required below port 1024, which
+    # is exactly why the app binds to 8080 and the Service maps 80 -> 8080.
+    drop:
+      - ALL
+
+# -----------------------------------------------------------------------------
+# Scratch space
+# -----------------------------------------------------------------------------
+# Required because readOnlyRootFilesystem is true. emptyDir lives on the node
+# and is deleted with the pod - correct for scratch, never for state.
+tmpDir:
+  enabled: true
+  # sizeLimit turns a runaway temp file into a pod eviction rather than a
+  # filled node disk that takes every other pod on the node down with it.
+  sizeLimit: 64Mi
+
+# Additional volumes / mounts, appended as-is to the pod spec.
+volumes: []
+volumeMounts: []
+
+# -----------------------------------------------------------------------------
+# Service
+# -----------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  # Port 80 on the Service, 8080 in the container. The indirection means the
+  # process never needs NET_BIND_SERVICE to bind a privileged port.
+  port: 80
+  targetPort: 8080
+  # appProtocol is read by service meshes and by some ingress controllers to
+  # pick the right protocol handling. Cheap to set, occasionally load-bearing.
+  appProtocol: http
+  annotations: {}
+  # Only used when type is NodePort.
+  nodePort: ""
+
+# -----------------------------------------------------------------------------
+# Ingress (networking.k8s.io/v1)
+# -----------------------------------------------------------------------------
+ingress:
+  enabled: false
+
+  # className replaces the deprecated kubernetes.io/ingress.class annotation.
+  # On minikube with the ingress addon this is "nginx".
+  className: "nginx"
+
+  annotations: {}
+  # Typical nginx annotations:
+  #   nginx.ingress.kubernetes.io/ssl-redirect: "true"
+  #   nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+  #   cert-manager.io/cluster-issuer: letsencrypt-prod
+
+  hosts:
+    - host: app.local
+      paths:
+        - path: /
+          # pathType is REQUIRED in networking.k8s.io/v1 - there is no default.
+          #   Prefix  - matches on path element boundaries: /foo matches /foo
+          #             and /foo/bar but NOT /foobar.
+          #   Exact   - matches the path and nothing else.
+          #   ImplementationSpecific - whatever the controller decides. Avoid:
+          #             it makes the manifest non-portable between controllers.
+          pathType: Prefix
+
+  # tls:
+  #   - secretName: app-tls
+  #     hosts:
+  #       - app.example.com
+  tls: []
+
+# -----------------------------------------------------------------------------
+# Probes
+# -----------------------------------------------------------------------------
+# The distinction, because it is the single most commonly misunderstood pair of
+# fields in Kubernetes:
+#
+#   liveness  "is this process wedged? should I RESTART it?"
+#             Failure -> kubelet kills and restarts the container.
+#             Must NOT check dependencies. If it pings the database, a database
+#             blip restarts every pod in the fleet at once and turns a degraded
+#             service into a full outage plus a thundering herd.
+#
+#   readiness "should this pod receive TRAFFIC right now?"
+#             Failure -> pod IP is removed from the Service endpoints. Nothing
+#             is restarted. This is where "warming up" and "draining" belong.
+#
+#   startup   "has it finished booting?" Suspends the other two until it
+#             passes. For a slow-starting app this is what lets you keep a
+#             tight liveness period without the kubelet killing the container
+#             during boot. Our app starts in milliseconds, so it is off.
+probes:
+  liveness:
+    enabled: true
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    # 3 x 10s = up to 30 seconds of failure before a restart. Tighter than
+    # this and a GC pause or a noisy neighbour can trigger a restart of a
+    # perfectly healthy pod.
+    failureThreshold: 3
+    successThreshold: 1
+
+  readiness:
+    enabled: true
+    path: /readyz
+    initialDelaySeconds: 2
+    # Readiness polls faster than liveness. Taking a sick pod out of rotation
+    # is cheap and reversible; restarting one is neither.
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+    # Must be 1 - Kubernetes rejects any other value for readiness.
+    successThreshold: 1
+
+  startup:
+    enabled: false
+    path: /healthz
+    initialDelaySeconds: 0
+    periodSeconds: 2
+    timeoutSeconds: 2
+    # 30 x 2s = a 60 second boot budget.
+    failureThreshold: 30
+
+# -----------------------------------------------------------------------------
+# Scheduling
+# -----------------------------------------------------------------------------
+# topologySpreadConstraints spread replicas across failure domains. Without
+# them the scheduler is free to put all three replicas on one node, and that
+# node's reboot is your outage - the PDB will not save you, because a node
+# failure is an involuntary disruption.
+#
+# whenUnsatisfiable:
+#   DoNotSchedule  - hard requirement; pods stay Pending if it cannot be met.
+#   ScheduleAnyway - soft preference. Correct for a 1-node dev cluster, where
+#                    DoNotSchedule would leave every replica Pending forever.
+#
+# Enabled in gitops/environments/prod/values.yaml, off here.
+topologySpreadConstraints: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# -----------------------------------------------------------------------------
+# Prometheus ServiceMonitor (monitoring.coreos.com/v1)
+# -----------------------------------------------------------------------------
+# Requires the Prometheus Operator CRDs. Guarded by `enabled` because applying
+# a ServiceMonitor to a cluster without the CRD fails the whole sync with
+# "no matches for kind ServiceMonitor" - which takes the entire Argo CD
+# Application OutOfSync, not just this one resource.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  path: /metrics
+  # Extra labels. Many Prometheus Operator installs use a release selector
+  # such as `release: kube-prometheus-stack`; without a matching label the
+  # ServiceMonitor is created, looks fine, and is silently never scraped.
+  labels: {}
+  # Leave false so the scrape's own job/instance labels win over any the
+  # target reports. Setting it true lets a target overwrite its own identity.
+  honorLabels: false
+  relabelings: []
+  metricRelabelings: []
+
+# -----------------------------------------------------------------------------
+# NetworkPolicy (networking.k8s.io/v1)
+# -----------------------------------------------------------------------------
+# The default Kubernetes network model is flat: every pod can reach every other
+# pod in the cluster, across namespaces. A compromised pod anywhere can scan
+# and reach this service's port directly, bypassing the ingress controller and
+# whatever auth lives there.
+#
+# Selecting a pod with ANY NetworkPolicy flips it to default-deny for the
+# policy types listed. From then on only explicitly allowed traffic flows.
+#
+# NOTE: NetworkPolicy is enforced by the CNI plugin, not by Kubernetes itself.
+# Calico, Cilium and Antrea enforce it. The default minikube/kindnet CNI does
+# NOT - the objects are accepted and silently do nothing. Verify with a real
+# connectivity test, never by `kubectl get netpol`.
+networkPolicy:
+  enabled: false
+
+  # Namespaces matched by name using the kubernetes.io/metadata.name label,
+  # which the API server sets automatically on every namespace since 1.22.
+  ingressControllerNamespace: ingress-nginx
+  monitoringNamespace: monitoring
+
+  # Egress to kube-dns. Forget this and every outbound hostname lookup in the
+  # pod hangs until it times out - a failure that looks like anything except a
+  # DNS problem.
+  allowDNS: true
+  dnsNamespace: kube-system
+
+  # Allow all other egress. Tightening this to specific CIDRs/ports is the
+  # right production answer; it needs a real dependency inventory first.
+  allowAllEgress: true
+
+  extraIngress: []
+  extraEgress: []

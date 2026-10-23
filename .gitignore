@@ -1,0 +1,109 @@
+# ---------------------------------------------------------------------------
+# Go
+# ---------------------------------------------------------------------------
+# Compiled binaries. We never commit build output: the artifact of record is
+# the OCI image in GHCR, produced reproducibly by CI.
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace / coverage
+go.work
+go.work.sum
+coverage.out
+coverage.html
+coverage.txt
+
+# Vendor directory - we rely on the module proxy + go.sum for integrity.
+vendor/
+
+# ---------------------------------------------------------------------------
+# Node / tooling (commitlint, markdown tooling, local helpers)
+# ---------------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+
+# ---------------------------------------------------------------------------
+# Terraform (reserved for the future cloud-cluster module)
+# ---------------------------------------------------------------------------
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+!example.tfvars
+crash.log
+crash.*.log
+
+# ---------------------------------------------------------------------------
+# Kubernetes / Helm local artifacts
+# ---------------------------------------------------------------------------
+# Packaged chart tarballs - the chart is published as an OCI artifact instead.
+*.tgz
+charts/*/charts/
+charts/*/Chart.lock
+# Rendered manifests produced by `make chart-template` during local debugging.
+rendered/
+_out/
+kubeconfig
+kubeconfig.*
+.kube/
+# Never commit a real kubeconfig or a cluster secret dump.
+*.kubeconfig
+
+# ---------------------------------------------------------------------------
+# Secrets - belt and braces. Real secret management is external-secrets /
+# sealed-secrets; nothing sensitive should ever reach this repository.
+# ---------------------------------------------------------------------------
+*.pem
+*.key
+!charts/**/*.key.example
+.env
+.env.*
+!.env.example
+secrets.yaml
+*-secret.yaml
+cosign.key
+cosign.pub
+
+# ---------------------------------------------------------------------------
+# IDE / editor
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/
+!.vscode/extensions.json
+*.iml
+*.swp
+*.swo
+*~
+.history/
+
+# ---------------------------------------------------------------------------
+# OS
+# ---------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ---------------------------------------------------------------------------
+# Scan / report output
+# ---------------------------------------------------------------------------
+trivy-results.sarif
+sbom.spdx.json
+*.sarif

@@ -1,0 +1,419 @@
+---
+# Main CI/CD pipeline.
+#
+# Trigger: every push to main, and every pull request. Path filtering (the
+# `changes` job, powered by dorny/paths-filter) means a docs-only PR skips
+# lint/test/build/security/sign entirely — it would be wasted compute and
+# wasted minutes-quota for a change that cannot possibly break the app.
+#
+# Job graph:
+#   changes --> lint --+
+#                       +--> build --> security --> sign --> gitops-update (main only)
+#               test ---+
+#
+# Every `uses:` below is pinned to a commit SHA, not a floating tag like
+# `@v4`. A floating tag is a mutable pointer controlled by a third party —
+# the exact supply-chain weakness this whole repo exists to demonstrate how
+# to avoid (see docs/security.md). Dependabot (.github/dependabot.yml) is
+# what keeps these SHAs from going stale: it opens a PR bumping the SHA (and
+# the version comment) every time one of these actions cuts a release.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Only one CI run per ref at a time. A new push cancels the superseded run
+# instead of letting two builds for the same branch race each other to push
+# an image or to rewrite gitops/environments/dev/values.yaml.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Repository-default permissions are read-only; every job below declares
+# exactly the extra scope it needs and nothing more. A workflow with blanket
+# `write-all` permissions is a bigger blast radius than the job it is
+# running — if a dependency (an Action, a linter plugin) is ever compromised,
+# the damage it can do is bounded by what this block grants.
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.23"
+  IMAGE_NAME: ghcr.io/fakhfakhahmed/gitops-cicd-platform/app
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Path filter: decides which downstream jobs actually need to run.
+  # ---------------------------------------------------------------------------
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      app: ${{ steps.filter.outputs.app }}
+      chart: ${{ steps.filter.outputs.chart }}
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        id: filter
+        with:
+          filters: |
+            app:
+              - 'app/**'
+              - '.github/workflows/ci.yml'
+            chart:
+              - 'charts/**'
+
+  # ---------------------------------------------------------------------------
+  # Lint: fail fast on style/vet issues before spending time on tests or builds.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint (golangci-lint)
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: app/go.sum
+
+      # golangci-lint-action brings its own pinned golangci-lint binary and
+      # wires up the repo's .golangci.yml automatically, so the version used
+      # in CI and the version a developer runs locally (via `make lint`) stay
+      # the same.
+      - uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758593cd566ec1 # v6.1.0
+        with:
+          version: v1.61.0
+          working-directory: app
+          args: --timeout=5m
+
+  # ---------------------------------------------------------------------------
+  # Test: race detector + coverage, uploaded so it survives the job for later
+  # inspection (and so a future codecov/coveralls step has something to read).
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test (go test -race)
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: app/go.sum
+
+      - name: go vet
+        run: go vet ./...
+
+      # -race is non-negotiable for a server that handles concurrent
+      # requests with shared atomics (server.ready, server.shuttingDown) —
+      # exactly the kind of bug a plain `go test` will never catch because it
+      # depends on goroutine scheduling to manifest.
+      - name: go test
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+      - uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874 # v4.4.0
+        with:
+          name: coverage-report
+          path: app/coverage.out
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Build: multi-arch image, pushed to GHCR with semver/sha/branch tags.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build & push image
+    needs: [changes, lint, test]
+    # Build even if app/ didn't change on a PR (so the full pipeline is
+    # exercised and reviewable), but only PUSH on a real push to main —
+    # docker/build-push-action's `push:` input below handles that distinction.
+    if: needs.changes.outputs.app == 'true' || needs.changes.outputs.chart == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      image-ref: ${{ env.IMAGE_NAME }}
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      # QEMU + Buildx is what lets a single ubuntu-latest (amd64) runner
+      # produce a genuine arm64 image too, via emulation, rather than
+      # requiring a second native arm64 runner.
+      - uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3.2.0
+
+      - uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+
+      - uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # docker/metadata-action computes every tag and label the build needs
+      # from git context alone: a PR gets `pr-123`, a push to main gets
+      # `main` and `sha-<short-sha>`, and a `v*` tag (handled by release.yml,
+      # not here) would get full/partial semver tags. No hand-written
+      # `if: github.ref == ...` tag logic to get subtly wrong.
+      - uses: docker/metadata-action@8e5442c4ef9f78752691e2d8f8d19755c6f78e81 # v5.5.1
+        id: meta
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix=sha-,format=short
+            type=raw,value=main,enable={{is_default_branch}}
+
+      - uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        id: push
+        with:
+          context: app
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            COMMIT=${{ github.sha }}
+          # GHA-backed layer cache: subsequent builds of an unchanged
+          # go.sum reuse the dependency-download layer instead of
+          # re-fetching modules, which is most of the build time on a
+          # cold cache.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # sbom/provenance attestations embedded by buildx itself, on top
+          # of (not instead of) the standalone SPDX SBOM the security job
+          # generates below — belt and braces, and it is what makes
+          # `docker buildx imagetools inspect` show provenance without any
+          # extra tooling.
+          sbom: true
+          provenance: true
+
+      - name: Image digest
+        run: echo "Pushed digest ${{ steps.push.outputs.digest }}"
+
+  # ---------------------------------------------------------------------------
+  # Security: vulnerability scan (SARIF -> Security tab), misconfig scan, SBOM.
+  # ---------------------------------------------------------------------------
+  security:
+    name: Security scan
+    needs: build
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # security-events: write is what lets the Trivy SARIF results land on
+      # the repo's Security tab (Code scanning alerts) instead of only
+      # existing as a build log nobody reads after the run goes green.
+      security-events: write
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      # Image scan: known CVEs in OS packages and the Go module graph baked
+      # into the image, by digest (not by the mutable `main` tag) so this
+      # scan is provably scanning the exact artifact build produced.
+      - uses: aquasecurity/trivy-action@6c175e9c4083a92bbca2f9724c8a5e33bc2d97a5 # 0.28.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}
+          format: sarif
+          output: trivy-image-results.sarif
+          severity: CRITICAL,HIGH
+          # Scan-only here; see docs/security.md for why this job reports
+          # instead of gates on exit code — an early-stage demo repo treats
+          # a new CVE as visibility, not an automatic release blocker, which
+          # is a decision documented (not accidental).
+          exit-code: "0"
+
+      - uses: github/codeql-action/upload-sarif@2d92b76c45b91eb800e23d61f1263236e2f0ca6b # v3.26.11
+        with:
+          sarif_file: trivy-image-results.sarif
+          category: trivy-image
+
+      # Filesystem/misconfig scan: catches a bad Dockerfile instruction, a
+      # permissive Kubernetes manifest, or a hard-coded secret pattern in the
+      # repo itself — a different surface than the image scan above.
+      - uses: aquasecurity/trivy-action@6c175e9c4083a92bbca2f9724c8a5e33bc2d97a5 # 0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "0"
+
+      - uses: github/codeql-action/upload-sarif@2d92b76c45b91eb800e23d61f1263236e2f0ca6b # v3.26.11
+        with:
+          sarif_file: trivy-fs-results.sarif
+          category: trivy-fs
+
+      # SPDX SBOM: a machine-readable manifest of every package and module in
+      # the image. This is what lets you answer "are we affected by CVE-X" in
+      # minutes instead of days the next time a widely-used library has an
+      # incident (see: Log4Shell) — grep the SBOM instead of re-scanning
+      # every running image in the fleet.
+      - uses: anchore/sbom-action@f4919d1b6df7c4554838b56bc0ded7db0f69c1a2 # v0.17.2
+        with:
+          image: ${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874 # v4.4.0
+        with:
+          name: sbom
+          path: sbom.spdx.json
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # Sign: cosign keyless signing by digest, plus an SBOM attestation.
+  # ---------------------------------------------------------------------------
+  sign:
+    name: Sign image (cosign keyless)
+    needs: [build, security]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # id-token: write is the whole mechanism. It lets this job request a
+      # short-lived OIDC token from GitHub's own identity provider, which
+      # cosign exchanges with Sigstore's Fulcio for a short-lived signing
+      # certificate bound to THIS exact workflow run. No long-lived private
+      # key exists anywhere to steal — see docs/security.md.
+      id-token: write
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fbd635fe99da96a # v3.6.0
+
+      - uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: sbom
+
+      # Signing by DIGEST, not by tag, is the entire point. A signature over
+      # `app:main` would be meaningless the moment `main` moves to point at a
+      # different image — the signature and the thing it certifies would
+      # silently drift apart. A digest cannot move; the signature is
+      # permanently and unambiguously bound to these exact bytes.
+      - name: Sign image by digest
+        run: |
+          cosign sign --yes \
+            "${IMAGE_NAME}@${DIGEST}"
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          COSIGN_EXPERIMENTAL: "1"
+
+      # Attest the SBOM too: this is what lets a cluster-side policy engine
+      # (Kyverno, in the "what I'd do next" list in README.md) verify not
+      # just "this image was built by our CI" but "here is the exact package
+      # manifest it shipped with," without trusting a side channel for it.
+      - name: Attest SBOM
+        run: |
+          cosign attest --yes \
+            --predicate sbom.spdx.json \
+            --type spdxjson \
+            "${IMAGE_NAME}@${DIGEST}"
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          COSIGN_EXPERIMENTAL: "1"
+
+      - name: Verify (sanity check in-pipeline)
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/ci.yml@.*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${IMAGE_NAME}@${DIGEST}"
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+
+  # ---------------------------------------------------------------------------
+  # GitOps update: the push-to-pull handoff. This is the ONLY job that writes
+  # back to the repository, and it only ever touches one file.
+  # ---------------------------------------------------------------------------
+  gitops-update:
+    name: Update dev image tag
+    needs: [build, sign]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      # contents: write is scoped to THIS job only (every earlier job stays
+      # read-only), and even here it is used for exactly one commit to
+      # exactly one file.
+      contents: write
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          # A full history fetch is not needed; this job only ever commits
+          # on top of the current tip.
+          fetch-depth: 1
+
+      - name: Install yq
+        run: |
+          curl -sSLo /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          chmod +x /usr/local/bin/yq
+
+      # This is THE moment the pipeline flips from push-based (CI decides
+      # what happens) to pull-based (Argo CD decides what happens). CI's job
+      # ends the instant this commit lands — it does not call kubectl, it
+      # does not call the Argo CD API, it has no cluster credentials at all.
+      # Argo CD's own reconciliation loop notices the new commit on its next
+      # poll (or via its optional webhook) and does the actual deployment.
+      # See docs/gitops.md for why this split is the core idea of GitOps.
+      - name: Bump image.tag in dev values
+        run: |
+          set -euo pipefail
+          TAG="sha-$(git rev-parse --short HEAD)"
+          yq -i ".image.tag = \"${TAG}\"" gitops/environments/dev/values.yaml
+          echo "Set gitops/environments/dev/values.yaml image.tag=${TAG}"
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet -- gitops/environments/dev/values.yaml; then
+            echo "No change to dev values.yaml, nothing to commit."
+            exit 0
+          fi
+
+          git add gitops/environments/dev/values.yaml
+          # [skip ci] is essential here: without it, this bot commit would
+          # trigger a brand new CI run on main, which would build a new
+          # image, which would trigger another gitops-update commit — an
+          # infinite loop that burns Actions minutes until someone notices.
+          git commit -m "chore(gitops): deploy $(git rev-parse --short HEAD) to dev [skip ci]"
+          git push origin HEAD:main

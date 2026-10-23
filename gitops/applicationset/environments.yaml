@@ -1,0 +1,87 @@
+---
+# ApplicationSet: the "scale past three environments" pattern.
+#
+# gitops/applications/app-{dev,staging,prod}.yaml are hand-written, one file
+# per environment, and that is the RIGHT choice for exactly three
+# environments with meaningfully different sync policies (prod is manual,
+# the others are not). It is a bad choice for ten ephemeral per-PR preview
+# environments, or twenty regional clusters, because at that point the
+# per-file approach means copy-pasting near-identical YAML and the only thing
+# that changes is a directory name.
+#
+# This ApplicationSet is included as the demonstrated alternative: a single
+# generator produces one Application per matching directory under
+# gitops/environments/, so adding environment #4 is `mkdir
+# gitops/environments/qa && cp a values.yaml in` — no new Application
+# manifest at all.
+#
+# It is NOT wired into root-app.yaml (which only watches gitops/applications)
+# specifically so it does not fight the hand-written Applications over
+# ownership of the same three environments. Apply it manually to see the
+# pattern in action:
+#   kubectl apply -f gitops/applicationset/environments.yaml
+# against a throwaway namespace prefix, or adapt `destination.namespace`
+# below before doing so against app-dev/staging/prod.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: app-environments
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: gitops-cicd-platform
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+
+  generators:
+    # The git directory generator scans a path in the repo and emits one set
+    # of template parameters per matching directory. {{.path.basename}} below
+    # becomes "dev", "staging" or "prod" automatically — add
+    # gitops/environments/qa/values.yaml and a fourth Application appears on
+    # the next generator refresh with no other change anywhere.
+    - git:
+        repoURL: https://github.com/fakhfakhahmed/gitops-cicd-platform.git
+        revision: main
+        directories:
+          - path: gitops/environments/*
+
+  template:
+    metadata:
+      name: "appset-app-{{.path.basename}}"
+      labels:
+        app.kubernetes.io/part-of: gitops-cicd-platform
+        env: "{{.path.basename}}"
+        managed-by: applicationset
+    spec:
+      project: gitops-platform
+      sources:
+        - repoURL: https://github.com/fakhfakhahmed/gitops-cicd-platform.git
+          targetRevision: main
+          path: charts/app
+          helm:
+            valueFiles:
+              - "$values/{{.path.path}}/values.yaml"
+        - repoURL: https://github.com/fakhfakhahmed/gitops-cicd-platform.git
+          targetRevision: main
+          ref: values
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "appset-app-{{.path.basename}}"
+      syncPolicy:
+        automated:
+          # The blanket automation here is exactly why this pattern is NOT
+          # used for the real prod environment: an ApplicationSet applies one
+          # sync policy uniformly across every generated Application. Mixing
+          # "prod should be manual" into a generator means templating
+          # conditional sync policy per directory name, which is more
+          # machinery than three explicit files for only three environments.
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+      ignoreDifferences:
+        - group: apps
+          kind: Deployment
+          jsonPointers:
+            - /spec/replicas
