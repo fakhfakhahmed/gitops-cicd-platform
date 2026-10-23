@@ -94,7 +94,7 @@ jobs:
       # branch, and opens (or updates, on re-run) the PR — idempotent by
       # design, so re-running this workflow with the same inputs after
       # nothing has changed is a safe no-op rather than a duplicate PR.
-      - uses: peter-evans/create-pull-request@c5a7806660adbe173f04e3e038b0ccdcd758773c # v7.0.5
+      - uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v7.0.5
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: >-
