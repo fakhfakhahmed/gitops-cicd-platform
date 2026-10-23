@@ -163,7 +163,7 @@ jobs:
       # QEMU + Buildx is what lets a single ubuntu-latest (amd64) runner
       # produce a genuine arm64 image too, via emulation, rather than
       # requiring a second native arm64 runner.
-      - uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3.2.0
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
       - uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
 
