@@ -19,7 +19,7 @@
 # The tag is pinned to a minor version (1.23) rather than `latest`. Dependabot
 # bumps it; a floating tag means two builds of the same commit can produce
 # different binaries, which destroys the whole point of signing them.
-FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS builder
 
 # BUILDPLATFORM / TARGETOS / TARGETARCH are injected automatically by BuildKit
 # when building with `docker buildx --platform linux/amd64,linux/arm64`.
